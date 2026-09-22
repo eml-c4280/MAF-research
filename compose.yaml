@@ -1,0 +1,154 @@
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Your_password123"
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Built from ollama.Dockerfile rather than the bare image, so certs/ (see certs/README.md)
+  # gets installed - needed on a network that does TLS inspection (Zscaler, etc.), otherwise
+  # `ollama pull` fails with "certificate signed by unknown authority". No-op on a normal network.
+  ollama:
+    build:
+      context: .
+      dockerfile: ollama.Dockerfile
+    image: agentcore-ollama:local
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: pulls the default model into the ollama volume so `docker compose up` alone is
+  # enough - no manual `ollama pull` step required. If your machine is slow to pull it, this
+  # can take a while the first time; subsequent runs reuse the ollama-data volume. Reuses the
+  # image built for `ollama` above rather than building it again.
+  ollama-init:
+    image: agentcore-ollama:local
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: "http://ollama:11434"
+    entrypoint: ["ollama", "pull", "qwen3:0.6b"]
+    restart: "no"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./observability/otel-collector/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    depends_on:
+      - tempo
+      - loki
+
+  tempo:
+    image: grafana/tempo:latest
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./observability/tempo/tempo-config.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+
+  loki:
+    image: grafana/loki:latest
+    command: ["-config.file=/etc/loki/loki-config.yaml"]
+    volumes:
+      - ./observability/loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki-data:/loki
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+
+  # Anonymous admin access - fine for a local demo stack, do not expose this compose file's
+  # Grafana to the public internet as-is.
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+
+  # The claim/worker tool set, exposed over MCP (Streamable HTTP) rather than called in-process
+  # by the api service - see docs/plan-mcp.md. Talks to the same AgentCoreDb directly (same
+  # repository code the tools always used); it does not run migrations itself, so it depends on
+  # mssql being healthy but not specifically on api having migrated yet (see docs/plan-mcp.md
+  # section 7 for why that's an accepted, narrow race on a fresh `docker compose up`).
+  claims-tools-server:
+    build:
+      context: .
+      dockerfile: claims-tools-server.Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Development"
+      ConnectionStrings__AgentCoreDb: "Server=mssql,1433;Database=AgentCoreDb;User Id=sa;Password=Your_password123;TrustServerCertificate=True;"
+    depends_on:
+      mssql:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      dockerfile: api.Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Development"
+      ConnectionStrings__AgentCoreDb: "Server=mssql,1433;Database=AgentCoreDb;User Id=sa;Password=Your_password123;TrustServerCertificate=True;"
+      # Talks to the containerized ollama service over the compose network - avoids relying on
+      # a native host install being reachable from Docker (host.docker.internal only works if
+      # Ollama binds 0.0.0.0, not its default 127.0.0.1-only, which trips people up).
+      Agent__OllamaHost: "http://ollama:11434"
+      Agent__ModelId: "qwen3:0.6b"
+      Agent__ClaimsToolsServerUrl: "http://claims-tools-server:8081/mcp"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      # JWT auth (docs/plan.md section 5) - these match appsettings.json's own defaults; spelled
+      # out here so a teammate can see/override the seeded login and signing key without having
+      # to go find them in source. This demo key is NOT safe for a real deployment - rotate it
+      # (and every other secret below) before this ever runs anywhere but a local/demo stack.
+      Jwt__SigningKey: "agentcore-demo-signing-key-change-me-3f8a91b2"
+      Jwt__Issuer: "AgentCore"
+      Jwt__Audience: "AgentCoreClients"
+      Seed__SuperAdminEmail: "superadmin@agentcore.local"
+      Seed__SuperAdminPassword: "SuperAdmin123!"
+    depends_on:
+      mssql:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
+      otel-collector:
+        condition: service_started
+      claims-tools-server:
+        condition: service_started
+
+volumes:
+  mssql-data:
+  ollama-data:
+  tempo-data:
+  loki-data:
+  prometheus-data:
+  grafana-data:

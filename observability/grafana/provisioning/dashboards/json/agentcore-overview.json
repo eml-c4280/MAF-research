@@ -1,0 +1,193 @@
+{
+  "uid": "agentcore-overview",
+  "title": "AgentCore Overview",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 2,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    { "id": 100, "type": "row", "title": "Agent Activity", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 } },
+    {
+      "id": 1, "title": "Agent runs (by mode/outcome)", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "targets": [{ "expr": "sum by (mode, outcome) (rate(agentcore_agent_runs_total[5m]))", "legendFormat": "{{mode}} / {{outcome}}" }]
+    },
+    {
+      "id": 2, "title": "Agent run duration (p50 / p95 / p99)", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(agentcore_agent_run_duration_seconds_bucket[5m])))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(agentcore_agent_run_duration_seconds_bucket[5m])))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(agentcore_agent_run_duration_seconds_bucket[5m])))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 3, "title": "PendingActions queued (by action type)", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "targets": [{ "expr": "sum by (action_type) (rate(agentcore_pending_actions_queued_total[5m]))", "legendFormat": "{{action_type}}" }]
+    },
+    {
+      "id": 4, "title": "Total agent runs (1h)", "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 9 },
+      "targets": [{ "expr": "sum(increase(agentcore_agent_runs_total[1h]))" }]
+    },
+    {
+      "id": 5, "title": "Agent run failure rate (1h)", "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 9 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "thresholds": { "mode": "absolute", "steps": [
+        { "color": "green", "value": null }, { "color": "orange", "value": 0.05 }, { "color": "red", "value": 0.2 }
+      ] } }, "overrides": [] },
+      "targets": [{ "expr": "sum(increase(agentcore_agent_runs_total{outcome=\"failure\"}[1h])) / clamp_min(sum(increase(agentcore_agent_runs_total[1h])), 1)" }]
+    },
+    {
+      "id": 6, "title": "Pending actions queued (1h)", "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 13 },
+      "targets": [{ "expr": "sum(increase(agentcore_pending_actions_queued_total[1h]))" }]
+    },
+
+    { "id": 200, "type": "row", "title": "API Performance", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 } },
+    {
+      "id": 10, "title": "Request rate (by route)", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [{ "expr": "sum by (http_route) (rate(http_server_request_duration_seconds_count[5m]))", "legendFormat": "{{http_route}}" }]
+    },
+    {
+      "id": 11, "title": "Error rate (5xx, by route)", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [{ "expr": "sum by (http_route) (rate(http_server_request_duration_seconds_count{http_response_status_code=~\"5..\"}[5m]))", "legendFormat": "{{http_route}}" }]
+    },
+    {
+      "id": 12, "title": "Request duration (p50 / p95 / p99)", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 26 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(http_server_request_duration_seconds_bucket[5m])))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(http_server_request_duration_seconds_bucket[5m])))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(http_server_request_duration_seconds_bucket[5m])))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 13, "title": "Active requests", "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 26 },
+      "targets": [{ "expr": "sum(http_server_active_requests)" }]
+    },
+    {
+      "id": 14, "title": "Responses by status code (1h)", "type": "piechart",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 26 },
+      "targets": [{ "expr": "sum by (http_response_status_code) (increase(http_server_request_duration_seconds_count[1h]))", "legendFormat": "{{http_response_status_code}}" }]
+    },
+    {
+      "id": 15, "title": "Exceptions handled (rate)", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 30 },
+      "targets": [{ "expr": "sum(rate(aspnetcore_diagnostics_exceptions_total[5m]))" }]
+    },
+
+    { "id": 300, "type": "row", "title": "Outbound Calls to Ollama", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 34 } },
+    {
+      "id": 20, "title": "Ollama call rate (by status)", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 35 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [{ "expr": "sum by (http_response_status_code) (rate(http_client_request_duration_seconds_count{server_address=\"ollama\"}[5m]))", "legendFormat": "{{http_response_status_code}}" }]
+    },
+    {
+      "id": 21, "title": "Ollama call duration (p50 / p95)", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 35 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(http_client_request_duration_seconds_bucket{server_address=\"ollama\"}[5m])))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(http_client_request_duration_seconds_bucket{server_address=\"ollama\"}[5m])))", "legendFormat": "p95" }
+      ]
+    },
+
+    { "id": 400, "type": "row", "title": "Connections (SignalR / Kestrel)", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 43 } },
+    {
+      "id": 30, "title": "Active SignalR connections", "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 44 },
+      "targets": [{ "expr": "sum(signalr_server_active_connections)" }]
+    },
+    {
+      "id": 31, "title": "Active Kestrel connections", "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 44 },
+      "targets": [{ "expr": "sum(kestrel_active_connections)" }]
+    },
+    {
+      "id": 32, "title": "SignalR connection duration", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 44 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [{ "expr": "histogram_quantile(0.95, sum by (le) (rate(signalr_server_connection_duration_seconds_bucket[5m])))", "legendFormat": "p95" }]
+    },
+
+    { "id": 500, "type": "row", "title": ".NET Runtime", "collapsed": true, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 50 }, "panels": [
+      {
+        "id": 40, "title": "GC collections (rate, by generation)", "type": "timeseries",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 51 },
+        "targets": [{ "expr": "sum by (generation) (rate(process_runtime_dotnet_gc_collections_count_total[5m]))", "legendFormat": "{{generation}}" }]
+      },
+      {
+        "id": 41, "title": "GC allocation rate", "type": "timeseries",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 51 },
+        "fieldConfig": { "defaults": { "unit": "Bps" }, "overrides": [] },
+        "targets": [{ "expr": "sum(rate(process_runtime_dotnet_gc_allocations_size_bytes_total[5m]))" }]
+      },
+      {
+        "id": 42, "title": "Thread pool queue length", "type": "timeseries",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 59 },
+        "targets": [{ "expr": "sum(process_runtime_dotnet_thread_pool_queue_length)" }]
+      },
+      {
+        "id": 43, "title": ".NET exceptions (rate)", "type": "timeseries",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 59 },
+        "targets": [{ "expr": "sum(rate(process_runtime_dotnet_exceptions_count_total[5m]))" }]
+      }
+    ] },
+
+    { "id": 600, "type": "row", "title": "Logs", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 67 } },
+    {
+      "id": 50, "title": "Recent logs", "type": "logs",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 68 },
+      "options": { "showTime": true, "showLabels": false, "wrapLogMessages": true, "sortOrder": "Descending" },
+      "targets": [{ "expr": "{service_name=\"AgentCore.Api\"}" }]
+    },
+    {
+      "id": 51, "title": "Errors only", "type": "logs",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 78 },
+      "options": { "showTime": true, "showLabels": true, "wrapLogMessages": true, "sortOrder": "Descending" },
+      "targets": [{ "expr": "{service_name=\"AgentCore.Api\"} | detected_level=\"error\"" }]
+    },
+
+    { "id": 700, "type": "row", "title": "Traces", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 86 } },
+    {
+      "id": 60, "title": "Recent traces", "type": "table",
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 87 },
+      "targets": [{ "queryType": "traceqlSearch", "query": "{resource.service.name=\"AgentCore.Api\"}", "limit": 20, "tableType": "traces" }]
+    }
+  ]
+}

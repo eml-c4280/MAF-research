@@ -1,0 +1,13 @@
+bin/
+obj/
+*.user
+
+# UI (Vite/React) - node_modules alone is 100MB+, never commit it
+ui/node_modules/
+ui/dist/
+ui/.env.local
+
+# IDE / OS
+.vs/
+.idea/
+.DS_Store

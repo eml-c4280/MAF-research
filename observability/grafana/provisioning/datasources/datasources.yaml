@@ -1,0 +1,67 @@
+# Auto-provisioned Grafana datasources for the AgentCore observability stack (compose.yaml
+# mounts this file into Grafana's provisioning directory). Hostnames match the compose service
+# names. Explicit `uid`s so Tempo/Loki can cross-link each other and Prometheus (see below) -
+# without a fixed uid, Grafana generates a random one and the links below can't reference it
+# reliably. Two things worth knowing if you ever see this fail on a fresh boot:
+#
+# - "Datasource provisioning error: data source not found" on startup, even though this file is
+#   correct, means stale state in the grafana-data volume (e.g. from an earlier provisioning
+#   attempt with different uids) - `docker compose rm -f grafana && docker volume rm
+#   agent-core_grafana-data` and start again. It is NOT a real circular-reference problem: the
+#   two-way Tempo<->Loki link below was verified working on a clean volume.
+# - Any `$something` inside a jsonData value is expanded by Grafana's OWN provisioning-time
+#   environment-variable substitution before it ever reaches Tempo/Loki - `$__tags.job` above
+#   would silently become `.job` (Grafana treats `__tags` as an unset env var and blanks it).
+#   Escape it as `$${__tags.job}` so the literal `${__tags.job}` reaches Tempo/Loki to evaluate
+#   themselves. Confirmed via the live datasource API that this is exactly what was going wrong.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      derivedFields:
+        - datasourceUid: tempo
+          matcherType: label
+          matcherRegex: trace_id
+          name: TraceID
+          url: "$${__value.raw}"
+          urlDisplayLabel: "View Trace"
+
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      # Trace -> Logs: jump from any span to the log lines it produced. Every AgentCore.Api log
+      # already carries trace_id as Loki structured metadata (confirmed directly against a
+      # running instance), so this matches on trace ID exactly rather than a time-window guess.
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: "-1m"
+        spanEndTimeShift: "1m"
+        filterByTraceID: true
+        filterBySpanID: false
+        tags: [{ key: "service.name", value: "service_name" }]
+      # Trace -> Metrics: from a span, jump to that service's p95 request-duration query.
+      tracesToMetrics:
+        datasourceUid: prometheus
+        tags: [{ key: "service.name", value: "job" }]
+        queries:
+          - name: "Request duration for this service"
+            query: 'histogram_quantile(0.95, sum by (le) (rate(http_server_request_duration_seconds_bucket{job="$${__tags.job}"}[5m])))'
+      search:
+        hide: false
+      nodeGraph:
+        enabled: true

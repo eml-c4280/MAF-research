@@ -1,0 +1,18 @@
+@ClaimsToolsServer_HostAddress = http://localhost:5050
+
+# This is an MCP (Model Context Protocol) server, not a REST API - there's no plain GET endpoint
+# to try here. Use an MCP inspector, or AgentCore.Agents' AgentToolsFactory (a real McpClient),
+# to talk to it. See docs/plan-mcp.md.
+
+### List tools (MCP JSON-RPC over Streamable HTTP)
+POST {{ClaimsToolsServer_HostAddress}}/mcp
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/list"
+}
+
+###

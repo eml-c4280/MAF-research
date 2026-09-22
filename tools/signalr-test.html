@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>AgentCore - Live Agent Activity (test page)</title>
+  <script src="https://cdn.jsdelivr.net/npm/@microsoft/signalr@8.0.7/dist/browser/signalr.min.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+    label { display: block; margin-top: 0.75rem; font-weight: 600; }
+    input { width: 100%; padding: 0.4rem; margin-top: 0.25rem; box-sizing: border-box; }
+    button { margin-top: 0.75rem; padding: 0.5rem 1rem; cursor: pointer; }
+    #log { margin-top: 1.5rem; background: #111; color: #0f0; padding: 1rem; border-radius: 6px;
+           font-family: ui-monospace, monospace; font-size: 0.85rem; white-space: pre-wrap;
+           max-height: 60vh; overflow-y: auto; }
+    .status { margin-top: 0.5rem; font-size: 0.9rem; color: #555; }
+  </style>
+</head>
+<body>
+  <h1>AgentCore - Live Agent Activity</h1>
+  <p>
+    Connects to <code>/hubs/agent-activity</code> and shows <code>RunStarted</code> /
+    <code>ToolCallStarted</code> / <code>ToolCallCompleted</code> / <code>RunCompleted</code> /
+    <code>RunFailed</code> events as they happen. Open this file directly in a browser (no
+    server needed for the page itself), then trigger
+    <code>POST /api/agent/claims/{id}/process</code> in Swagger for the same claim id you
+    subscribe to below - or hit "Trigger via API" here.
+  </p>
+
+  <label>API base URL</label>
+  <input id="apiBase" value="http://localhost:8080" />
+
+  <label>Claim ID to watch</label>
+  <input id="claimId" value="2" type="number" />
+
+  <label>X-Role (only used by the "Trigger via API" button, not by the hub itself)</label>
+  <input id="role" value="Admin" />
+
+  <button id="connectBtn">Connect &amp; subscribe</button>
+  <button id="triggerBtn">Trigger via API (process this claim)</button>
+  <div class="status" id="status">Not connected.</div>
+
+  <div id="log"></div>
+
+  <script>
+    let connection = null;
+
+    function log(line) {
+      const el = document.getElementById('log');
+      const ts = new Date().toISOString().split('T')[1].replace('Z', '');
+      el.textContent += `[${ts}] ${line}\n`;
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function setStatus(text) {
+      document.getElementById('status').textContent = text;
+    }
+
+    document.getElementById('connectBtn').addEventListener('click', async () => {
+      const apiBase = document.getElementById('apiBase').value.trim();
+      const claimId = parseInt(document.getElementById('claimId').value, 10);
+
+      if (connection) {
+        await connection.stop();
+        connection = null;
+      }
+
+      connection = new signalR.HubConnectionBuilder()
+        .withUrl(`${apiBase}/hubs/agent-activity`)
+        .configureLogging(signalR.LogLevel.Warning)
+        .build();
+
+      connection.on('RunStarted', (e) => log(`RunStarted   runId=${e.runId} claimId=${e.claimId} prompt="${e.prompt}"`));
+      connection.on('ToolCallStarted', (e) => log(`ToolCall ->  ${e.toolName}(${e.argumentsJson})`));
+      connection.on('ToolCallCompleted', (e) => log(`ToolCall <-  ${e.toolName}: ${e.result}`));
+      connection.on('RunCompleted', (e) => {
+        log(`RunCompleted runId=${e.runId} model=${e.modelId} toolCalls=${e.toolCallCount} tokens(in/out/total)=${e.inputTokenCount ?? '-'}/${e.outputTokenCount ?? '-'}/${e.totalTokenCount ?? '-'} cost(in/out/total)=${e.inputCost ?? '-'}/${e.outputCost ?? '-'}/${e.totalCost ?? '-'}`);
+        if (e.reasoningText) log(`  thinking: ${e.reasoningText}`);
+        log(`  answer: ${e.finalAnswer}`);
+      });
+      connection.on('RunFailed', (e) => log(`RunFailed    runId=${e.runId} error="${e.errorMessage}"`));
+
+      connection.onclose(() => setStatus('Disconnected.'));
+
+      try {
+        await connection.start();
+        await connection.invoke('SubscribeToClaim', claimId);
+        setStatus(`Connected, subscribed to claim ${claimId}. Waiting for events...`);
+        log(`Subscribed to claim ${claimId}. Trigger a run now (button above, or POST /api/agent/claims/${claimId}/process in Swagger).`);
+      } catch (err) {
+        setStatus(`Connection failed: ${err}`);
+      }
+    });
+
+    document.getElementById('triggerBtn').addEventListener('click', async () => {
+      const apiBase = document.getElementById('apiBase').value.trim();
+      const claimId = parseInt(document.getElementById('claimId').value, 10);
+      const role = document.getElementById('role').value.trim();
+
+      try {
+        const resp = await fetch(`${apiBase}/api/agent/claims/${claimId}/process`, {
+          method: 'POST',
+          headers: { 'X-Role': role }
+        });
+        log(`Triggered process for claim ${claimId} -> HTTP ${resp.status}`);
+      } catch (err) {
+        log(`Trigger failed: ${err}`);
+      }
+    });
+  </script>
+</body>
+</html>
