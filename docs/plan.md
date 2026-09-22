@@ -6,6 +6,25 @@
 > checklist item is marked done (`[x]`) with a one-line note on what/where. See
 > [Change Log](#change-log) at the bottom for a running history of requirement changes.
 
+## Contents
+
+1. [Overview](#1-overview)
+2. [Key decisions](#2-key-decisions)
+3. [Solution structure](#3-solution-structure)
+4. [Domain model (MSSQL via EF Core)](#4-domain-model-mssql-via-ef-core)
+5. [Auth: JWT + user management](#5-auth-jwt--user-management)
+6. [Agent tool classification](#6-agent-tool-classification)
+7. [REST API surface (Swagger-documented)](#7-rest-api-surface-swagger-documented)
+8. [Observability (LGTM-style stack)](#8-observability-lgtm-style-stack)
+9. [Real-time agent visibility (SignalR)](#9-real-time-agent-visibility-signalr)
+10. [Docker Compose](#10-docker-compose)
+11. [Workflows (playbooks)](#11-workflows-playbooks)
+12. [UI](#12-ui-see-docsplan-uimd) (see `docs/plan-ui.md`)
+13. [Agent hardening & reliability (gap remediation)](#13-agent-hardening--reliability-gap-remediation)
+14. [Conversation sessions (multi-turn chat)](#14-conversation-sessions-multi-turn-chat)
+15. [Implementation checklist](#15-implementation-checklist) — phase-by-phase build history
+- [Change Log](#change-log) — dated log of every requirement/architecture change
+
 ## 1. Overview
 
 AgentCore V2.0 lives entirely in the `agent-core/` folder as a **new, standalone project**.
@@ -943,12 +962,14 @@ tracking exists to drive it).
 - [x] Emptied `HeaderRoleAuthenticationHandler.cs`, `ActorNameHeaderFilter.cs` to 0 bytes (the
   sandbox's permission settings deny `rm`, so the files still need a manual `rm` pass later - not
   referenced by anything, so they're dead weight, not a functional issue)
-- [ ] UI: **not done this pass** - `RoleGate`'s role-picker, `RoleContext`, `client.ts`'s
-  interceptor, and a Users admin page all still assume the old `X-Role` model. The backend no
-  longer accepts `X-Role` at all, so the existing UI cannot authenticate against it until this is
-  built. Deferred to a follow-up.
-- [ ] `README.md`: **not updated this pass** - still documents the old `X-Role` curl examples.
-  Deferred alongside the UI work.
+- [x] UI: **done in a follow-up pass** (`docs/plan-ui.md`'s Phase UI-7) - `RoleGate` became a real
+  login form, `RoleContext`/`useAuth()` decode the JWT's role claims, `client.ts`'s interceptor
+  sends `Authorization: Bearer <token>`, and a Users admin page + Workers page case-manager
+  assignment were added.
+- [x] `README.md`/`docs/`: **done in a follow-up pass** - the root README now leads with a system
+  architecture diagram and an agent-loop sequence diagram, documents the JWT login flow, and the
+  exhaustive per-endpoint curl reference moved to `docs/api-testing.md` to keep the README itself
+  public-app-appropriate rather than a test manual; `docs/README.md` is a new navigation index.
 - [x] **Row-level scoping**: `Worker.AssignedCaseManagerUserId` (nullable FK → `User`) + migration;
   `PUT /api/workers/{id}/assign-case-manager` (Admin/SuperAdmin only)
 - [x] `AgentCore.Domain.Authorization.WorkerAccessPolicy.CanAccessWorker(worker, callerRoles,
@@ -1001,12 +1022,13 @@ tracking exists to drive it).
   `ClaimsToolsServer`'s `CallerContext`, proving OBO holds across the process boundary, not just
   within the API.
 
-**Known gaps carried forward**: the UI and `README.md` still assume the old `X-Role` model (the UI
-cannot log in until its own follow-up is done); `ApprovalsController`/`AgentRunLogsController` got
-the `Manager`→`CaseManager` rename but no row-level scoping (an approval/run-log isn't tied to a
+**Known gaps carried forward**: `ApprovalsController`/`AgentRunLogsController` got the
+`Manager`→`CaseManager` rename but no row-level scoping (an approval/run-log isn't tied to a
 single worker the same direct way, and the user's request was specifically about worker-record and
 agent-action permission, not the approvals queue - left as a deliberate scope decision, not an
-oversight, revisit if that gap matters later).
+oversight, revisit if that gap matters later). (The UI and `README.md`/`docs/` gaps noted above
+when this phase first landed were since closed in follow-up passes - see this phase's checklist
+items and the later Change Log entries below.)
 
 ## Change Log
 
@@ -1527,3 +1549,27 @@ oversight, revisit if that gap matters later).
   end. UI and `README.md` updates are explicitly deferred (see the phase's "Known gaps carried
   forward" note) - the backend's auth model changed completely, so the existing UI cannot log in
   until its own follow-up lands; the user has not asked for that yet.
+- **2026-09-22** — Follow-up: migrated the UI to the new JWT model (`docs/plan-ui.md`'s Phase
+  UI-7 - real login form, `useAuth()`, Users admin page, Workers page case-manager assignment),
+  then did a full documentation pass before the first push to git, since teammates would read
+  these files first. Fixed genuine leftover staleness in source itself, not just docs: three MCP
+  sensitive tools' `[Description(...)]` text still said "Admin/Manager approval" from before the
+  role rename; `AgentActivityHub`/`Program.cs` comments still described the old `X-Role` header;
+  `AgentCore.Agents/DependencyInjection.cs`'s comment on `AgentToolsFactory` still described the
+  pre-Phase-12 shared-connection design. `.gitignore` was missing `ui/node_modules/` (100MB+) and
+  `ui/dist/` entirely - fixed before anything could be pushed. Overhauled `README.md`: added a
+  system-architecture section (Mermaid component diagram + a table linking each component to the
+  exact `docs/plan.md` section that covers it), an agent-loop sequence diagram and a tool-tier/
+  approval-gate diagram under a new "How the agent works" section, and a "Swapping the LLM
+  provider" note (the agent depends only on `Microsoft.Extensions.AI`'s `IChatClient`; Ollama is
+  constructed in exactly one line, so pointing at OpenAI/Azure OpenAI/a self-hosted
+  OpenAI-compatible server later needs no other change). Moved the exhaustive per-endpoint curl
+  reference out of `README.md` into a new `docs/api-testing.md` - a public-facing README
+  shouldn't double as a test manual - and added `docs/README.md` as a navigation index (which doc
+  covers what, suggested reading order) plus a table of contents to this file, since it had grown
+  past 1000 lines with no way to jump to a section. Fixed two now-stale checklist bullets under
+  Phase 12 above (UI/README were marked "not done this pass" - now done) and a few historical-but-
+  now-outdated design notes in `docs/plan-mcp.md` (the singleton-`McpClient` design it documents
+  was reversed by this same Phase 12, and one illustrative code sample's `[Description]` text and
+  `PendingActionRef` shape had drifted from the real current file) - annotated as superseded
+  rather than rewritten, to preserve the historical narrative those sections are there to record.

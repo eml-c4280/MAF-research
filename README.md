@@ -7,7 +7,185 @@ read data within that scope, but anything sensitive (emailing a worker, escalati
 a payout) is queued as a `PendingAction` that a human has to approve before it actually happens.
 
 Full architecture, design decisions, and the phase-by-phase implementation history live in
-[`docs/plan.md`](docs/plan.md). This file is the practical "how do I run and test this" guide.
+[`docs/`](docs/README.md) — start with [`docs/README.md`](docs/README.md) if you want the full
+picture. This file is the practical "how do I run and test this" guide — but starts with the
+system architecture and agent design, since that's what makes sense of everything that follows.
+
+## System architecture
+
+AgentCore is a small set of cooperating processes, not a monolith — deliberately split so the
+LLM-calling agent code and the claim/worker data-access tools live in separate deployable units
+(see [`docs/plan-mcp.md`](docs/plan-mcp.md) for why), and so identity/authorization is enforced
+independently at every boundary a request crosses, including inside the agent's own tool calls.
+
+```mermaid
+flowchart TB
+    UI["Web UI (React SPA)"]
+    SW["Swagger / curl"]
+
+    subgraph API["AgentCore.Api  (ASP.NET Core)"]
+        AUTH["AuthController / UsersController<br/>issues + validates JWTs"]
+        CRUD["Workers / Policies / Claims controllers<br/>WorkerAccessPolicy row-level checks"]
+        AGENTCTRL["AgentController / WorkflowsController"]
+        HUB["AgentActivityHub (SignalR)"]
+    end
+
+    subgraph AGENTS["AgentCore.Agents  (Microsoft Agent Framework)"]
+        FACTORY["WorkerClaimAgentFactory<br/>builds the AIAgent + its tool list"]
+    end
+
+    subgraph MCP["mcp/ClaimsToolsServer  (MCP server, separate process)"]
+        AUTOTOOLS["auto tools (read-only)<br/>rule tools (deterministic)"]
+        SENSTOOLS["sensitive tools<br/>write a PendingAction, never act"]
+    end
+
+    LLM["LLM Provider<br/>local Ollama today — swappable<br/>(OpenAI / Azure OpenAI / self-hosted)"]
+    DB[("MSSQL — AgentCoreDb")]
+    APPROVAL["ApprovalService<br/>executes the real side effect<br/>only on human approval"]
+    OTEL["otel-collector"]
+    GRAFANA["Grafana ⇐ Tempo / Prometheus / Loki"]
+
+    UI -- "REST, Authorization: Bearer JWT" --> API
+    SW -- "REST, Authorization: Bearer JWT" --> API
+    API -- EF Core --> DB
+    API -- "ClaimAgentService.ExecuteRunAsync" --> AGENTS
+    AGENTS -- "IChatClient (chat completion)" --> LLM
+    AGENTS -- "MCP / Streamable HTTP + X-Caller-User-Id, X-Caller-Role (OBO)" --> MCP
+    MCP -- EF Core --> DB
+    SENSTOOLS -. "PendingAction row" .-> APPROVAL
+    APPROVAL --> DB
+    API -- OTLP --> OTEL
+    OTEL --> GRAFANA
+```
+
+| Component | Project | Responsible for | Details |
+|---|---|---|---|
+| **Web UI** | `ui/` | Login form, dashboards, forms for every role | [`ui/README.md`](ui/README.md), [`docs/plan-ui.md`](docs/plan-ui.md) |
+| **AgentCore.Api** | `src/AgentCore.Api` | HTTP surface, JWT issuance/validation, row-level authorization, SignalR hub | [`docs/plan.md` §5](docs/plan.md) (Identity & Authorization), §7 (REST API surface) |
+| **AgentCore.Application** | `src/AgentCore.Application` | Orchestration: `ClaimAgentService`, `ApprovalService`, `AuthService`, `UserManagementService`, `WorkflowExecutionService` | [`docs/plan.md` §11](docs/plan.md) (Workflows), §14 (conversation sessions) |
+| **AgentCore.Agents** | `src/AgentCore.Agents` | Builds the `AIAgent` (Microsoft Agent Framework), the loop guards, compaction, and the MCP client | [`docs/plan.md` §13](docs/plan.md) (hardening & reliability); see "How the agent works" below |
+| **mcp/ClaimsToolsServer** | `mcp/ClaimsToolsServer` | A separate process exposing claim/worker tools over MCP; enforces the same row-level authorization independently | [`docs/plan-mcp.md`](docs/plan-mcp.md) (why it's a separate process) |
+| **AgentCore.Domain** / **Infrastructure** | `src/AgentCore.Domain`, `src/AgentCore.Infrastructure` | Entities, `WorkerAccessPolicy`, EF Core, MSSQL migrations/seed data | [`docs/plan.md` §4](docs/plan.md) (domain model) |
+| **Observability stack** | `observability/`, `compose.yaml` | OpenTelemetry Collector → Tempo/Prometheus/Loki → Grafana | [`docs/plan.md` §8](docs/plan.md) (Observability) — see "Configuring / using Grafana" below |
+| **Business rules** | `AgentCore.Domain.Rules` (`CoverageValidator`, `EscalationEvaluator`, `ClaimRiskScorer`, `EntitlementCalculator`) | Deterministic coverage/escalation/risk/payout logic the agent quotes but never overrides | [`docs/business-logic.md`](docs/business-logic.md) |
+| **Conceptual reference** | — | Framework/agentic-systems concepts (agent loop, MCP, HITL, identity propagation, observability, …), each cross-referenced against exactly where it's implemented in this codebase | [`docs/knowledge-base.md`](docs/knowledge-base.md) — every topic has an "AgentCore Implementation" subsection |
+| **API testing reference** | — | Every endpoint, role, and copy-paste curl payload | [`docs/api-testing.md`](docs/api-testing.md) |
+
+### How the agent works
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant Api as AgentCore.Api
+    participant Svc as ClaimAgentService
+    participant Agent as AIAgent (MAF)
+    participant LLM as LLM Provider
+    participant MCP as ClaimsToolsServer (MCP)
+    participant DB as MSSQL
+
+    User->>Api: POST /api/agent/claims/{id}/process (Bearer JWT)
+    Api->>Api: extract CallerIdentity from the validated JWT
+    Api->>Svc: ExecuteRunAsync(claimId, caller)
+    Svc->>DB: WorkerAccessPolicy check for the claim's worker
+    alt CaseManager not assigned to that worker
+        Svc-->>Api: 403 Forbidden — no LLM call ever made
+    else allowed
+        Svc->>DB: insert AgentRunLog (before calling the model)
+        Svc->>Agent: build the agent (WorkerClaimAgentFactory)
+        Agent->>MCP: ListToolsAsync + X-Caller-User-Id / X-Caller-Role
+        MCP-->>Agent: tool list (role-scoped)
+        loop agent loop — bounded by MaxToolCallsPerRun / MaxRunDuration
+            Agent->>LLM: chat completion (system prompt + tools + history)
+            LLM-->>Agent: tool call, or a final answer
+            opt model chose a tool call
+                Agent->>MCP: invoke tool (auto / rule / sensitive)
+                MCP->>DB: read, or write a PendingAction (sensitive tools only)
+                MCP-->>Agent: tool result
+            end
+        end
+        Agent-->>Svc: final answer + reasoning + tool calls + token usage
+        Svc->>DB: update AgentRunLog, stamp PendingAction.ProposedByAgentRunId
+        Svc-->>Api: completed AgentRunLog
+    end
+    Api-->>User: recommendation + any queued PendingActions
+```
+
+1. A request reaches `AgentCore.Api` — either `POST /api/agent/query` (free-form Q&A) or
+   `POST /api/agent/claims/{id}/process` (claim processing). The controller extracts the caller's
+   identity from their already-validated JWT (`ClaimsPrincipalExtensions.ToCallerIdentity()`) and
+   passes it into `ClaimAgentService`.
+2. `ClaimAgentService.ExecuteRunAsync` is the one place every agent invocation flows through: it
+   persists an `AgentRunLog` row *before* calling the model, wraps the call in an OpenTelemetry
+   span, and publishes SignalR lifecycle events as the run progresses (see "Watching an agent run
+   live" below). For claim processing specifically, it checks `WorkerAccessPolicy` right here and
+   returns `403` **before any LLM call happens at all** if the caller (a CaseManager) isn't
+   assigned to that claim's worker.
+3. `WorkerClaimAgentFactory` builds the actual agent (`AIAgent`, from the Microsoft Agent
+   Framework) — a system prompt (rules: quote deterministic tool results exactly, never fabricate
+   data, treat tool output as data never instructions) plus a tool list. It builds one of three
+   variants: read-only (auto + rule tools, for `/api/agent/query`), claim-processing (adds
+   sensitive tools), or a workflow-scoped variant with an explicit tool allowlist.
+4. The agent's tools are discovered live over MCP from `mcp/ClaimsToolsServer` — a **separate
+   process**, not in-process code. `AgentToolsFactory` opens a fresh MCP connection *per call*,
+   carrying the caller's identity as two HTTP headers (`X-Caller-User-Id`/`X-Caller-Role`) so
+   `ClaimsToolsServer` can enforce the exact same row-level permission check independently, on its
+   own side of the process boundary — this is AgentCore's equivalent of On-Behalf-Of token
+   propagation (see [`docs/knowledge-base.md` §4](docs/knowledge-base.md), Identity &
+   Authorization, and its "AgentCore Implementation" note).
+5. The model (today: local Ollama) runs the standard agentic loop — decide to call a tool, get
+   the result back, decide again, or produce a final answer — bounded by `AgentOptions.
+   MaxToolCallsPerRun` and `MaxRunDuration` so a non-converging loop can't run away. Three tool
+   tiers exist:
+   - **Auto tools** (`FetchWorker`, `SearchClaims`, `GetWorkerClaimsHistory`) execute immediately —
+     read-only, no side effect.
+   - **Rule tools** (`CoverageChecker`, `EscalationEvaluator`, `ClaimRiskScorer`) are deterministic
+     C# logic, not the model's judgement — the model must quote their result, never recompute it
+     (see [`docs/business-logic.md`](docs/business-logic.md)).
+   - **Sensitive tools** (`SendWorkerEmailTool`, `SendEscalationEmailTool`, `CalculatePayoutTool`)
+     never act — each only ever writes a `PendingAction` row and returns a reference to it. The
+     real side effect (simulated email send, a payout write-back onto the claim) happens only
+     when a human calls `POST /api/approvals/{id}/approve` via `ApprovalService`. **This is the
+     one invariant that must never be violated anywhere in this codebase: the LLM proposes, it
+     never executes.**
+6. The completed run (final answer, reasoning text, token counts/cost, every tool call) is
+   returned to the caller and is also the permanent audit record — see "What an agent run's
+   result actually contains" in [`docs/api-testing.md`](docs/api-testing.md).
+
+The three tool tiers and the approval gate, visually — the invariant that makes the whole system
+safe to point at an LLM at all:
+
+```mermaid
+flowchart LR
+    LLM["LLM decides<br/>which tool to call"]
+
+    LLM --> AUTO["Auto tool<br/>(FetchWorker, SearchClaims, …)"]
+    LLM --> RULE["Rule tool<br/>(CoverageChecker, EscalationEvaluator, …)"]
+    LLM --> SENS["Sensitive tool<br/>(SendWorkerEmail, CalculatePayout, …)"]
+
+    AUTO --> RESULT1["Executes immediately<br/>— read-only"]
+    RULE --> RESULT2["Executes immediately<br/>— deterministic C#, model quotes it, never recomputes"]
+    SENS --> QUEUE["Writes a PendingAction row<br/>— NEVER acts"]
+
+    QUEUE --> HUMAN{"A human reviews:<br/>POST /api/approvals/{id}/approve or /reject"}
+    HUMAN -- approve --> EXECUTE["ApprovalService executes<br/>the real side effect"]
+    HUMAN -- reject --> NOOP["No effect at all"]
+```
+
+### Swapping the LLM provider
+
+This project runs against a **local Ollama** instance (`qwen3:0.6b`) specifically so it has no
+external dependency or per-token cost during development — nothing about the architecture assumes
+Ollama specifically. `AgentCore.Agents` depends only on `Microsoft.Extensions.AI`'s `IChatClient`
+abstraction; the only place a concrete provider is constructed is one line in
+`WorkerClaimAgentFactory.BuildAgent` (`new OllamaApiClient(...)`, then wrapped as an `IChatClient`
+with the loop-guard/compaction layers applied on top of *that* abstraction, not the concrete
+type). Pointing this at a different provider in a real deployment — **OpenAI**, **Azure OpenAI**,
+or a **self-hosted** OpenAI-compatible server (vLLM, LM Studio, TGI, etc.) — means replacing that
+one construction with the equivalent `IChatClient` for that provider; everything downstream (tool
+discovery over MCP, the approval gate, guards, compaction, observability) is provider-agnostic
+and needs no change. `AgentOptions.InputPricePerMillionTokens`/`OutputPricePerMillionTokens`
+already exist for exactly this — they default to `0` for the free local model and only need
+setting once a metered provider is in the loop.
 
 ## Quick start
 
@@ -44,14 +222,18 @@ Grafana's datasources.
 
 ## Auth: JWT login
 
+> Full design/decisions: [`docs/plan.md` §5](docs/plan.md) (Identity & Authorization). Framework-
+> level background on this pattern (why an agent needs the caller's own identity, not a blanket
+> service identity): [`docs/knowledge-base.md` §4](docs/knowledge-base.md). Every endpoint,
+> role, and copy-paste curl example: [`docs/api-testing.md`](docs/api-testing.md).
+
 Real login, not a header trick: `POST /api/auth/login` with an email/password issues a JWT,
 sent as `Authorization: Bearer <token>` on every other call. There is no `X-Role` header
 anymore — a request with no token, an expired one, or a garbage one gets `401`.
 
 **Roles are a strict hierarchy** — `SuperAdmin` ⊃ `Admin` ⊃ `CaseManager` — each level can do
 everything the level below it can, plus more. A token carries every role its tier inherits (a
-`SuperAdmin`'s token lists all three), so "Admin, CaseManager" in the tables below also always
-means "and SuperAdmin", without needing to spell it out on every row.
+`SuperAdmin`'s token lists all three).
 
 - **SuperAdmin** — everything Admin can do, plus create/manage Admin and SuperAdmin accounts.
   Exactly one is seeded at startup.
@@ -62,360 +244,33 @@ means "and SuperAdmin", without needing to spell it out on every row.
   server-side, including inside the agent's own tool calls — see `docs/plan.md` §5). Cannot
   delete Workers, edit Policies, delete Claims, or manage users.
 
-The stack seeds exactly one **SuperAdmin** at startup:
+The stack seeds exactly one **SuperAdmin** at startup (`superadmin@agentcore.local` /
+`SuperAdmin123!`, configurable via `Seed:SuperAdminEmail`/`Seed:SuperAdminPassword` in
+`compose.yaml`). Use it to create Admin/CaseManager accounts and assign Workers to CaseManagers —
+see [`docs/api-testing.md`](docs/api-testing.md) for those calls.
 
-| | |
-|---|---|
-| Email | `superadmin@agentcore.local` |
-| Password | `SuperAdmin123!` |
-
-(Configurable via the API's `Seed:SuperAdminEmail`/`Seed:SuperAdminPassword` — see `compose.yaml`.)
-Use it to create Admin/CaseManager accounts via `/api/users` (see "Managing users" below), and to
-assign Workers to CaseManagers via `/api/workers/{id}/assign-case-manager`.
-
-**Log in and grab a token:**
+**Log in:**
 ```sh
 curl -X POST -H "Content-Type: application/json" http://localhost:8080/api/auth/login \
   -d '{"email":"superadmin@agentcore.local","password":"SuperAdmin123!"}'
 # → {"accessToken":"eyJ...", "expiresAtUtc":"...", "user":{...}}
 ```
 
-Every curl example below assumes you've saved the token to a shell variable:
-```sh
-TOKEN=$(curl -s -X POST -H "Content-Type: application/json" http://localhost:8080/api/auth/login \
-  -d '{"email":"superadmin@agentcore.local","password":"SuperAdmin123!"}' | jq -r .accessToken)
-
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/workers
-```
-(`jq` is only needed for the one-liner above — swap in any JSON-field extraction you like, or
-just paste the `accessToken` value manually.)
-
 In **Swagger**, click **Authorize** (top right), paste the token (no `Bearer ` prefix needed —
-Swashbuckle adds it), and it's applied to every subsequent "Try it out" call.
-
-### Managing users
-
-Only Admin+ can manage accounts, via `UsersController` (`/api/users`):
-
-```sh
-# Create a CaseManager (Admin can only assign CaseManager; SuperAdmin can assign any role)
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  http://localhost:8080/api/users \
-  -d '{"name":"Alex Rivera","email":"alex@agentcore.local","password":"CaseManager123!","role":"CaseManager"}'
-
-# List users
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/users
-
-# Assign a worker to that CaseManager (Admin+ only) — id is the created user's id above
-curl -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  http://localhost:8080/api/workers/1/assign-case-manager \
-  -d '{"caseManagerUserId": 2}'
-
-# Deactivate / reset password (soft-disable only, never hard-deleted)
-curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/users/2/deactivate
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  http://localhost:8080/api/users/2/reset-password -d '{"newPassword":"NewPass456!"}'
-```
-
-Once that CaseManager logs in and calls `GET /api/workers`, they'll see only worker `1` — and
-asking the agent about a *different*, unassigned worker (or processing a claim for one) is
-denied with `403`, both via REST and through the agent's own tool calls.
+Swashbuckle adds it), and it's applied to every subsequent "Try it out" call — the easiest way to
+explore the API without touching curl at all.
 
 ## Testing the REST API
 
-All routes below are under `http://localhost:8080`.
-
-"CaseManager" below is always row-scoped to their assigned workers where a worker is involved
-(directly or via a claim/policy) — an Admin/SuperAdmin is unrestricted.
-
-| Method & path | Role | What it does |
-|---|---|---|
-| `POST /api/auth/login` | none | Log in, get back a JWT |
-| `GET /api/auth/me` | any authenticated | Current user's own profile |
-| `GET /api/users` | Admin+ | List users |
-| `POST /api/users` | Admin+ | Create a user (assignable roles depend on caller's own role) |
-| `PUT /api/users/{id}` | Admin+ | Update a user's name/email |
-| `POST /api/users/{id}/deactivate` | Admin+ | Soft-disable a user (never hard-deleted) |
-| `POST /api/users/{id}/reset-password` | Admin+ | Reset a user's password |
-| `GET /api/workers` | Admin+, CaseManager | List workers (CaseManager sees only their own) |
-| `GET /api/workers/{id}` | Admin+, CaseManager | Get one worker (403 if not assigned to you) |
-| `POST /api/workers` | Admin+ | Create a worker |
-| `PUT /api/workers/{id}` | Admin+ | Update a worker |
-| `PUT /api/workers/{id}/assign-case-manager` | Admin+ | Assign/unassign a worker's CaseManager |
-| `DELETE /api/workers/{id}` | Admin+ | Delete a worker |
-| `GET /api/policies` | Admin+, CaseManager | List all insurance policies |
-| `GET /api/policies/{id}` | Admin+, CaseManager | Get one policy |
-| `GET /api/policies/workers/{workerId}` | Admin+, CaseManager | Get a worker's policy |
-| `POST /api/policies` | Admin+ | Create a policy |
-| `PUT /api/policies/{id}` | Admin+ | Update a policy |
-| `DELETE /api/policies/{id}` | Admin+ | Delete a policy |
-| `GET /api/claims` | Admin+, CaseManager | List all claims |
-| `GET /api/claims/{id}` | Admin+, CaseManager | Get one claim |
-| `GET /api/claims/search?claimType=&status=&years=` | Admin+, CaseManager | Search claims |
-| `GET /api/claims/workers/{workerId}/history?years=` | Admin+, CaseManager | Claims history + stats for a worker |
-| `POST /api/claims` | Admin+, CaseManager | Create a claim |
-| `PUT /api/claims/{id}` | Admin+, CaseManager | Update a claim |
-| `DELETE /api/claims/{id}` | Admin+ | Delete a claim |
-| `POST /api/agent/query` | Admin+, CaseManager | Free-form Q&A, one-shot, read-only tools only |
-| `POST /api/agent/claims/{id}/process` | Admin+, CaseManager | Run the agent against a claim (403 if you're a CaseManager not assigned to its worker, 409 if the claim is `Disputed`) |
-| `POST /api/agent/sessions` | Admin+, CaseManager | Start a new multi-turn chat session |
-| `GET /api/agent/sessions` | Admin+, CaseManager | List chat sessions, most-recently-active first |
-| `POST /api/agent/sessions/{id}/messages` | Admin+, CaseManager | Send the next message in a session |
-| `GET /api/agent/sessions/{id}/messages` | Admin+, CaseManager | Full turn history for a session |
-| `GET /api/agent/runs` / `GET /api/agent/runs/{id}` | Admin+, CaseManager | Read-only agent-run audit log |
-| `GET /api/approvals?status=AwaitingApproval` | Admin+, CaseManager | List queued sensitive actions |
-| `POST /api/approvals/{id}/approve` | Admin+, CaseManager | Approve — actually executes the action (returns 410 if the action expired, per `ExpiresAt`) |
-| `POST /api/approvals/{id}/reject` | Admin+, CaseManager | Reject — no side effect (always allowed, even for an expired action) |
-| `POST /api/approvals/batch` | Admin+, CaseManager | Apply one decision per id in one call; full per-action detail in the response |
-| `GET /api/workflows` | Admin+, CaseManager | List workflow definitions (playbooks) |
-| `POST /api/workflows` | Admin+ | Define a new workflow |
-| `POST /api/workflows/{id}/run` | Admin+, CaseManager | Structured trigger - run a workflow with explicit inputs |
-| `POST /api/workflows/chat` | Admin+, CaseManager | Chat trigger - free text routed to the best-matching workflow, or falls back to `/api/agent/query` |
-| `GET /api/workflows/runs` | Admin+, CaseManager | Audit log of every workflow execution |
-
-### Request payloads (copy-paste curl for every endpoint)
-
-Every JSON body uses **camelCase** field names (ASP.NET Core's default `System.Text.Json`
-behavior) and `DateOnly` fields as plain `"YYYY-MM-DD"` strings. Enum fields (`status`) are
-case-insensitive. `$TOKEN` below is whatever account's token you logged in with — swap in a
-CaseManager's token (see "Managing users" above) to see the row-level scoping in action on any
-endpoint the table above marks CaseManager-accessible. IDs below (`workerId: 1`, claim `2`, etc.)
-match the seeded data.
-
-**Workers** — `/api/workers`
-
-```sh
-# List / get
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/workers
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/workers/1
-
-# Create (Admin only)
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  http://localhost:8080/api/workers \
-  -d '{
-        "code": "WRK-1007",
-        "name": "Priya Nair",
-        "role": "Electrician",
-        "location": "Brisbane, AU",
-        "email": "priya.nair@example.com",
-        "phoneNumber": "+61 400 000 000",
-        "hourlyRate": 48.50,
-        "yearsOfExperience": 6,
-        "isAvailable": true
-      }'
-
-# Update (Admin only) — same body shape, full replace
-curl -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  http://localhost:8080/api/workers/1 \
-  -d '{
-        "code": "WRK-1001",
-        "name": "Ethan Brooks",
-        "role": "Crane Operator",
-        "location": "Sydney, AU",
-        "email": "ethan.brooks@example.com",
-        "phoneNumber": "+61 400 111 111",
-        "hourlyRate": 52.00,
-        "yearsOfExperience": 9,
-        "isAvailable": false
-      }'
-
-# Delete (Admin only)
-curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/workers/7
-```
-
-**Policies** — `/api/policies`
-
-```sh
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/policies
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/policies/1
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/policies/workers/1
-
-# Create (Admin only) — coverageType is "Workers Compensation" or "Public Liability" in the
-# seed data, but it's a free-text field, not an enum
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  http://localhost:8080/api/policies \
-  -d '{
-        "workerId": 1,
-        "policyNumber": "POL-9007",
-        "provider": "SafeGuard Mutual",
-        "coverageType": "Workers Compensation",
-        "coverageAmount": 250000,
-        "startDate": "2026-01-01",
-        "endDate": "2027-01-01",
-        "isActive": true
-      }'
-
-# Update (Admin only) — same body shape
-curl -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  http://localhost:8080/api/policies/1 \
-  -d '{
-        "workerId": 1,
-        "policyNumber": "POL-9001",
-        "provider": "SafeGuard Mutual",
-        "coverageType": "Workers Compensation",
-        "coverageAmount": 250000,
-        "startDate": "2023-01-01",
-        "endDate": "2026-12-31",
-        "isActive": true
-      }'
-
-# Delete (Admin only)
-curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/policies/7
-```
-
-**Claims** — `/api/claims`
-
-```sh
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/claims
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/claims/2
-
-# Search — all query params optional; years defaults to 3
-curl -H "Authorization: Bearer $TOKEN" \
-  "http://localhost:8080/api/claims/search?claimType=Injury&status=Approved&years=5"
-
-# Claims history + stats for a worker
-curl -H "Authorization: Bearer $TOKEN" \
-  "http://localhost:8080/api/claims/workers/1/history?years=5"
-
-# Create (Admin+ or CaseManager) — status is one of Pending/UnderReview/Approved/Rejected
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  http://localhost:8080/api/claims \
-  -d '{
-        "workerId": 1,
-        "claimNumber": "CLM-260918-021",
-        "claimDate": "2026-09-18",
-        "claimType": "Injury",
-        "amount": 2750,
-        "status": "Pending",
-        "description": "Twisted ankle stepping off a ladder during a routine inspection."
-      }'
-
-# Update (Admin+ or CaseManager) — same body shape, full replace
-curl -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  http://localhost:8080/api/claims/2 \
-  -d '{
-        "workerId": 2,
-        "claimNumber": "CLM-240609-002",
-        "claimDate": "2024-06-09",
-        "claimType": "Equipment Damage",
-        "amount": 1150,
-        "status": "UnderReview",
-        "description": "Damaged multimeter, no supporting incident report."
-      }'
-
-# Delete (Admin only)
-curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/claims/21
-```
-
-**Agent** — `/api/agent`
-
-Claim processing now runs deterministic business rules (`docs/business-logic.md`) before the
-model ever sees the claim: `CoverageChecker` (CV), `EscalationEvaluator` (ES), and
-`ClaimRiskScorer` (FR) are computed server-side and handed to the model as settled facts to quote,
-not something it can recompute. A coverage failure sets the claim to `CoverageRejected` in code
-regardless of what the model does; a triggered escalation removes `PayoutCalculator`/
-`WorkerEmailSender` from the model's toolset for that run entirely; and `PayoutCalculator` itself
-computes its own amount (never a model-supplied number) and refuses outright on a coverage
-failure. All three rule tools are also freely callable on their own via `/api/agent/query` (e.g.
-"is claim 5 covered?").
-
-```sh
-# Free-form Q&A — read-only tools only, no PendingActions ever queued from this endpoint
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  http://localhost:8080/api/agent/query \
-  -d '{
-        "prompt": "Which workers have had more than 2 claims in the last 3 years?"
-      }'
-
-# Process a claim — no request body, claim id is in the path
-curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/agent/claims/2/process
-
-# Read-only agent-run audit log
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/agent/runs
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/agent/runs/1
-
-# Multi-turn chat — distinct from the one-shot /query above; history carries forward within a
-# session (the framework's own session state, persisted server-side) until you start a new one
-curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/agent/sessions
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  http://localhost:8080/api/agent/sessions/1/messages \
-  -d '{"message": "Remember the word zebra-quartz."}'
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  http://localhost:8080/api/agent/sessions/1/messages \
-  -d '{"message": "What word did I just ask you to remember?"}'
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/agent/sessions/1/messages
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/agent/sessions
-```
-
-**Approvals** — `/api/approvals`
-
-```sh
-# List — status defaults to AwaitingApproval; also accepts Approved/Rejected/Executed
-curl -H "Authorization: Bearer $TOKEN" "http://localhost:8080/api/approvals?status=AwaitingApproval"
-
-# Approve / reject — no request body, id is the PendingAction id from the list above
-curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/approvals/1/approve
-curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/approvals/1/reject
-
-# Batch — one decision per id, applied in order; response has full detail per id, not a
-# single collapsed confirmation
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  http://localhost:8080/api/approvals/batch \
-  -d '{"decisions":[{"id":1,"approve":true},{"id":2,"approve":false}]}'
-```
-
-Each `PendingAction` also carries an `expiresAt` (7 days from when it was queued) and an
-`isExpired` flag. `approve` on an already-expired action returns `410 Gone` rather than silently
-executing something a human never actually looked at — `reject` is always allowed, since
-rejecting has no side effect to worry about. If the approved side effect itself throws (e.g. the
-payout write-back failing), the action's status becomes `ExecutionFailed` with `executionError`
-set, instead of the request coming back as an unhandled `500`.
-
-### A full walkthrough (via Swagger)
-
-1. Open http://localhost:8080/swagger, `POST /api/auth/login` with the seeded SuperAdmin
-   credentials (see "Auth: JWT login" above), copy `accessToken` from the response, then click
-   **Authorize** and paste it in.
-2. `GET /api/workers` — confirm the 6 seeded workers exist.
-3. `GET /api/claims/workers/1/history?years=5` — claims history + stats for worker 1.
-4. `POST /api/agent/claims/2/process` — runs the real agent against claim `2`. Returns a
-   recommendation and any `PendingAction`s it queued (e.g. a proposed payout or worker email).
-5. `GET /api/approvals?status=AwaitingApproval` — see what got queued.
-6. `POST /api/approvals/{id}/approve` — approving a payout writes the amount back onto the
-   claim and marks it `Approved`; approving an email/escalation just logs a simulated send
-   (`docker compose logs api` shows it) — nothing real is ever sent.
-
-### Same walkthrough with curl
-
-```sh
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/workers
-
-curl -X POST -H "Authorization: Bearer $TOKEN" \
-  http://localhost:8080/api/agent/claims/2/process
-
-curl -H "Authorization: Bearer $TOKEN" \
-  "http://localhost:8080/api/approvals?status=AwaitingApproval"
-
-curl -X POST -H "Authorization: Bearer $TOKEN" \
-  http://localhost:8080/api/approvals/1/approve
-```
-
-### What an agent run's result actually contains
-
-Every `AgentRunLog` (returned by `/api/agent/query`, `/api/agent/claims/{id}/process`'s `run`
-field, and `/api/agent/runs/{id}`) carries the full picture of that run, not just the answer:
-
-| Field | What it is |
-|---|---|
-| `finalAnswer` | The user-facing response |
-| `reasoningText` | The model's own "thinking" / chain-of-thought, when it exposes one — qwen3's reasoning mode does, via `Microsoft.Extensions.AI`'s `TextReasoningContent`; separate from `finalAnswer` |
-| `modelId` | Which model served this run, e.g. `"qwen3:0.6b"` |
-| `toolCallCount` | How many tools the agent actually invoked — counted directly, not self-reported |
-| `toolCallsJson` | The full call/result sequence (tool name, arguments, result) |
-| `inputTokenCount` / `outputTokenCount` / `totalTokenCount` | Real usage from the model provider (`response.Usage`, confirmed populated by Ollama) |
-| `inputCost` / `outputCost` / `totalCost` | Tokens × `Agent:InputPricePerMillionTokens` / `Agent:OutputPricePerMillionTokens` (both default `0` — a local Ollama model is free; set these if you point `Agent:OllamaHost` at a paid, metered provider instead) |
+Swagger (`http://localhost:8080/swagger`) is the fastest way to try any endpoint interactively.
+For copy-paste curl — the full endpoint/role table, request payloads for every resource, a
+Swagger walkthrough, and what an `AgentRunLog` actually contains — see
+[`docs/api-testing.md`](docs/api-testing.md).
 
 ## Workflows (playbooks)
+
+> Full design/decisions: [`docs/plan.md` §11](docs/plan.md). Curl examples for running or
+> defining a workflow: [`docs/api-testing.md`](docs/api-testing.md).
 
 A `WorkflowDefinition` is a named, reusable playbook — a fixed prompt template + input schema +
 restricted tool set, configured ahead of time by an Admin. This is deliberately **not** a general
@@ -430,52 +285,17 @@ Three built-in workflows are seeded automatically:
 | **Worker Claims History** | `workerId`, optional `dateFrom`/`dateTo` | Read-only summary of a worker's claims — its allowed tool set has no sensitive tools at all |
 | **Escalate High-Value Claim** | `claimId` | Assesses coverage/escalation and, if warranted, queues an escalation email — `PayoutCalculator` and `WorkerEmailSender` are not in this workflow's tool set, so the model cannot call them regardless of what it decides |
 
-**Structured trigger** — call a workflow directly with its inputs:
-
-```sh
-# List the catalog
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/workflows
-
-# Run one (id is from the list above)
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  http://localhost:8080/api/workflows/2/run \
-  -d '{"inputs": {"workerId": 1}}'
-```
-
-**Chat trigger** — free text is routed to the best-matching workflow by a small intent-matching
-step; below a confidence threshold, or if a required input can't be resolved from the text, it
-**falls back to `/api/agent/query`** rather than guessing or silently running the wrong workflow
-on someone's data:
-
-```sh
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  http://localhost:8080/api/workflows/chat \
-  -d '{"text": "show me the claims history for worker 1"}'
-```
-
-The response's `fellBackToQuery` flag tells you which path was taken. Every workflow execution —
-structured or chat, including the fallback — is still just an ordinary `AgentRunLog` under the
-hood (same `PendingAction` interception, same SignalR events); `GET /api/workflows/runs` is purely
-audit metadata layered on top (which definition, which resolved inputs, and for a chat trigger,
-the original text and the intent-matcher's confidence).
-
-Defining a new workflow (Admin only):
-
-```sh
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  http://localhost:8080/api/workflows \
-  -d '{
-        "name": "Coverage Check",
-        "description": "Runs just the CV rule family and reports the result.",
-        "inputSchemaJson": "[{\"name\":\"claimId\",\"type\":\"int\",\"required\":true,\"description\":\"The claim to check.\"}]",
-        "promptTemplate": "Check coverage for claim #{claimId} using CoverageChecker and report the result exactly.",
-        "allowedToolNamesJson": "[\"CoverageChecker\"]",
-        "isChatTriggerable": true,
-        "chatTriggerHintsJson": "[\"is this claim covered\",\"check coverage\"]"
-      }'
-```
+Two ways to trigger one: a **structured trigger** calls a workflow directly with explicit inputs;
+a **chat trigger** routes free text to the best-matching workflow via a small intent-matching
+step, falling back to `/api/agent/query` below a confidence threshold or when a required input
+can't be resolved — never guessing or silently running the wrong workflow on someone's data. Both
+paths, including the fallback, are still just an ordinary `AgentRunLog` under the hood (same
+`PendingAction` interception, same SignalR events); `GET /api/workflows/runs` is purely audit
+metadata layered on top.
 
 ## Watching an agent run live (SignalR)
+
+> Full design/decisions: [`docs/plan.md` §9](docs/plan.md).
 
 Swagger can't show this — the agent-run lifecycle is broadcast over a SignalR hub at
 `/hubs/agent-activity`, independent of the REST call that triggered it.
@@ -502,6 +322,10 @@ Note: events publish in sequence right after the (blocking) agent call returns �
 token-by-token live generation. See `docs/plan.md` section 9 for why.
 
 ## Configuring / using Grafana
+
+> Full design/decisions: [`docs/plan.md` §8](docs/plan.md) (Observability). Framework-level
+> background on why agent traces are audit evidence, not just debugging output:
+> [`docs/knowledge-base.md` §6](docs/knowledge-base.md).
 
 Open http://localhost:3000 — **no login needed** (anonymous admin access is enabled via
 `GF_AUTH_ANONYMOUS_ENABLED` in `compose.yaml`, fine for local use, don't expose this to an
@@ -602,11 +426,13 @@ agent-core/
 ├── api.Dockerfile / claims-tools-server.Dockerfile / ollama.Dockerfile / compose.yaml
 ├── tools/signalr-test.html        # Browser test page for the live agent-activity hub
 └── docs/
+    ├── README.md                  # Start here - what each doc below covers, suggested reading order
     ├── plan.md                   # Full architecture, decisions, and phase-by-phase history
     ├── plan-ui.md                 # The React UI: design, pages/routes, what's built vs. planned
     ├── plan-mcp.md               # The ClaimsToolsServer MCP split: design, tradeoffs, checklist
     ├── business-logic.md          # Deterministic insurance rules (coverage/eligibility/payout/escalation)
-    └── knowledge-base.md          # MAF/agentic-systems framework reference, cross-referenced to this codebase
+    ├── knowledge-base.md          # MAF/agentic-systems framework reference, cross-referenced to this codebase
+    └── api-testing.md            # Copy-paste curl for every endpoint
 ```
 
 ## Troubleshooting

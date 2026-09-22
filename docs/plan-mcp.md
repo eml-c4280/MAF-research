@@ -42,9 +42,9 @@ tradeoff being made.
 |---|---|---|
 | MCP transport | Streamable HTTP (`ModelContextProtocol.AspNetCore`'s `MapMcp`) | Not stdio. The scaffold is already `Microsoft.NET.Sdk.Web` with Swagger/Kestrel and a fixed dev port (`http://localhost:5050`, from `Properties/launchSettings.json`), and the rest of this repo already runs every component as its own long-lived compose service reachable over the network (`ollama`, `mssql`, …) rather than a child process spawned via stdio. "Local" is read as *"runs on this deployment, not a third-party/remote MCP server"* — not *"stdio child process."* |
 | SDK | `ModelContextProtocol` / `ModelContextProtocol.Core` / `ModelContextProtocol.AspNetCore`, v2.2.0 | The official C# MCP SDK. Confirmed via a scratch project that `McpClientTool` (client side) already derives from `Microsoft.Extensions.AI.AIFunction` → `AITool`, so tool results from `ListToolsAsync()` can be used directly as `ChatOptions.Tools` with **no conversion step**. Confirmed `[McpServerToolType]`/`[McpServerTool]` (server side) is built on the same `AIFunctionFactory` machinery as today's `AIFunctionFactory.Create(...)`, so the existing `[Description]` attributes on tool methods/parameters (the whole point of the previous `IAgentTool` refactor) carry over unchanged. |
-| Data access from the MCP server | Direct EF Core against the same `AgentCoreDb`, via new project references to `AgentCore.Domain`/`AgentCore.Infrastructure` | Rejected alternative: have `ClaimsToolsServer` call back into `AgentCore.Api`'s REST endpoints over HTTP. Direct DB access keeps the tool implementations almost byte-for-byte identical to today (same repository interfaces, same method bodies) and avoids a second network hop plus the awkwardness of an internal service needing to fabricate an `X-Role` value for endpoints that expect a human-asserted role. |
+| Data access from the MCP server | Direct EF Core against the same `AgentCoreDb`, via new project references to `AgentCore.Domain`/`AgentCore.Infrastructure` | Rejected alternative: have `ClaimsToolsServer` call back into `AgentCore.Api`'s REST endpoints over HTTP. Direct DB access keeps the tool implementations almost byte-for-byte identical to today (same repository interfaces, same method bodies) and avoids a second network hop plus the awkwardness of an internal service needing to fabricate a human-asserted-role value for endpoints that expect one (at the time this was written, that meant `X-Role`; since Phase 12, docs/plan.md §5, it's a JWT-derived role — the reasoning is unchanged either way). |
 | `PendingAction.ProposedByAgentRunId` correlation | **Host backfills it after the fact**, not the tool | See §4 — this is the one genuinely new problem this refactor introduces, since `AgentToolRunContext`'s in-process ambient-scope trick doesn't cross a process boundary. |
-| MCP client lifetime | Singleton, created once and reused | Unlocked by the above: once tools no longer need a per-run correlation id, there's no reason to reconnect per agent run. One long-lived `McpClient` amortizes the MCP handshake cost. |
+| MCP client lifetime | ~~Singleton, created once and reused~~ **Superseded by Phase 12** | Original reasoning: once tools no longer need a per-run correlation id, there's no reason to reconnect per agent run, so one long-lived `McpClient` amortizes the handshake cost. **This was reversed once permission enforcement needed to know which user is running** (`docs/plan.md` §5) — `AgentToolsFactory` now opens a fresh `McpClient` connection *per call*, carrying that call's `CallerIdentity` as headers, accepting the extra per-run handshake latency as the cost of real authorization. |
 | Tool auto/sensitive split | Kept client-side, by tool **name** | MCP has no native concept of "sensitive"; the server exposes one flat tool list. `AgentToolsFactory` keeps its existing job — filtering — just backed by `ListToolsAsync()` results instead of local `IAgentTool` instances. Tool `ToolAnnotations` (`ReadOnly`/`Destructive`, native MCP metadata) are set to match, for any future MCP-aware tooling/inspector, but are not what AgentCore itself relies on for the split. |
 | Solution wiring | `ClaimsToolsServer.csproj` added to `AgentCore.sln` under a new `mcp` solution folder | Mirrors how `tests/AgentCore.Agents.Tests` was wired in under `tests` — `dotnet build AgentCore.sln` should still build everything. |
 | Docker Compose | New `claims-tools-server` service, own Dockerfile, **host port published** | Mirrors `api.Dockerfile`'s shape (multi-stage, `certs/` CA install). `api`'s `Agent:ClaimsToolsServerUrl` points at `http://claims-tools-server:8081/mcp` in compose, `http://localhost:5050/mcp` for local non-Docker dev (matching the scaffold's existing launch profile). `8081:8081` is published to the host so it can be poked directly with curl or an MCP inspector during development, same as Swagger is for `api`. |
@@ -91,7 +91,10 @@ Two ways to solve this were considered:
    creates the run row. It also reintroduces a fresh-connection-per-run requirement, undoing the
    singleton-client simplification below. And it means trusting a plain, unauthenticated header
    between two local services for something that ends up in an audit trail — acceptable in a demo,
-   but worth avoiding if there's a cleaner option.
+   but worth avoiding if there's a cleaner option. (This specific rejection is about correlating a
+   *run id* and still stands unchanged — the fresh-connection-per-call reversal did eventually
+   happen anyway, but for an unrelated reason: Phase 12's identity/permission headers, `docs/plan.md`
+   §5, not run correlation. The two concerns just happened to land on the same tradeoff.)
 2. **Host backfills the FK after the tool call returns (chosen).** The MCP sensitive tools still
    create the `PendingAction` row themselves (same as today — they're the ones with the domain
    knowledge of what's being proposed), but leave `ProposedByAgentRunId` unset and return a small
@@ -148,7 +151,7 @@ public class CalculatePayoutTool
     // ctor unchanged (IPendingActionRepository only - AgentToolRunContext dependency removed, see §4)
 
     [McpServerTool(Name = "PayoutCalculator", Destructive = true)]
-    [Description("Propose a payout amount to approve for this claim. This does NOT apply the payout — it queues it for Admin/Manager approval first.")]
+    [Description("Propose a payout amount to approve for this claim. This does NOT apply the payout — it queues it for Admin/CaseManager approval first.")]
     public async Task<PendingActionRef> CalculatePayoutAsync(
         [Description("The Id of the claim this payout relates to.")] int claimId,
         [Description("The proposed payout amount.")] decimal proposedAmount,
@@ -161,6 +164,14 @@ public class CalculatePayoutTool
 
 public record PendingActionRef(int PendingActionId, string ActionType);
 ```
+
+> **Superseded by later phases, kept here only as the MCP-split-era illustration of the
+> attribute/return-shape pattern**: `CalculatePayoutTool` no longer takes `proposedAmount` as a
+> parameter at all — Phase 10 (`docs/business-logic.md`) made the amount a deterministic,
+> server-computed value (`EntitlementCalculator`) precisely so the model can never supply or
+> influence it. Phase 12 (`docs/plan.md` §5) also added a `DenialReason` field to
+> `PendingActionRef` and a `CallerContext`/`WorkerAccessPolicy` check before any of this runs. See
+> `mcp/ClaimsToolsServer/Tools/CalculatePayoutTool.cs` for the actual current shape.
 
 The three auto tools get `[McpServerTool(Name = "...", ReadOnly = true)]` and are otherwise
 unchanged (they already return a plain string, which stays a plain string — no structured-result
@@ -179,6 +190,16 @@ that stays solely `AgentCore.Api`'s job (only one process should own schema appl
 compose service ordering in §7 accounts for this.
 
 ## 6. Client design (`AgentCore.Agents`)
+
+> **This section documents the original MCP-split design** — accurate as of this phase, but the
+> singleton/lazy-connection shape below was **superseded by Phase 12** (`docs/plan.md` §5, Identity
+> & Authorization): once tool calls needed to carry the caller's identity for row-level
+> permission enforcement, a single shared connection could no longer be reused across different
+> callers. `AgentToolsFactory` now builds a fresh `McpClient` per call instead, and
+> `BuildToolsetAsync` takes a `CallerIdentity` parameter that doesn't appear below. See
+> `src/AgentCore.Agents/Tools/AgentToolsFactory.cs` for the real current implementation; the rest
+> of this section (async factory methods, DI registration as a stateless singleton, dropping
+> `IAgentTool`) is still accurate.
 
 - **`AgentOptions`** gains `ClaimsToolsServerUrl` (default `http://localhost:5050/mcp`).
 - **`AgentToolsFactory`** is rewritten, same public shape/intent, new implementation:

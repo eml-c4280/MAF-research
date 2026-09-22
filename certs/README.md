@@ -38,5 +38,6 @@ Dockerfile's `COPY certs/ ...` still works), and `update-ca-certificates` simply
 ## A note on committing certs
 
 These are **public root certificates, not private keys** — nothing secret leaks by having one
-here. Some teams still prefer to keep internal infrastructure details out of version control; if
-that's you, add `certs/*.crt` to `.gitignore` and have each developer drop in their own.
+here. That said, `.gitignore` excludes `certs/*.crt` by default (this folder's own `README.md`/
+`.gitkeep` stay tracked) so a corporate CA doesn't end up baked into a repo other teams pull —
+each developer drops in their own locally.

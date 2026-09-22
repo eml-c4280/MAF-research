@@ -11,3 +11,8 @@ ui/.env.local
 .vs/
 .idea/
 .DS_Store
+
+# Corporate root CA a teammate drops into certs/ locally (see certs/README.md) - never the
+# folder itself, since certs/README.md and certs/.gitkeep stay tracked, only the actual cert
+# (api.Dockerfile/ollama.Dockerfile only ever look for *.crt there).
+certs/*.crt
