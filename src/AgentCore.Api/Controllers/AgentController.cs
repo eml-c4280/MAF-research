@@ -1,7 +1,9 @@
 using System.Security.Claims;
+using AgentCore.Agents;
 using AgentCore.Api.Auth;
 using AgentCore.Api.Contracts;
 using AgentCore.Application.Agents;
+using AgentCore.Application.Workflows;
 using AgentCore.Domain.Common;
 using AgentCore.Domain.Entities;
 using AgentCore.Domain.Enums;
@@ -16,8 +18,13 @@ namespace AgentCore.Api.Controllers;
 public class AgentController : ControllerBase
 {
     private readonly ClaimAgentService _agentService;
+    private readonly WorkflowExecutionService _workflowExecutionService;
 
-    public AgentController(ClaimAgentService agentService) => _agentService = agentService;
+    public AgentController(ClaimAgentService agentService, WorkflowExecutionService workflowExecutionService)
+    {
+        _agentService = agentService;
+        _workflowExecutionService = workflowExecutionService;
+    }
 
     [HttpPost("query")]
     public async Task<ActionResult<AgentRunLogDto>> Query(AgentQueryRequest request, CancellationToken ct)
@@ -27,14 +34,19 @@ public class AgentController : ControllerBase
             return BadRequest("Prompt is required.");
         }
 
-        var run = await _agentService.QueryAsync(request.Prompt, DescribeTrigger("POST /api/agent/query"), User.ToCallerIdentity(), ct);
+        // Alias for POST /api/agents/claims/query (Phase 13, docs/plan-agents.md §8) - kept for
+        // backward compatibility now that free-form Q&A can target any specialist by name.
+        var run = await _agentService.QueryAsync(AgentCatalog.ClaimsAgent, request.Prompt, DescribeTrigger("POST /api/agent/query"), User.ToCallerIdentity(), ct);
         return Ok(ToDto(run));
     }
 
     [HttpPost("claims/{id:int}/process")]
     public async Task<ActionResult<ProcessClaimResponse>> ProcessClaim(int id, CancellationToken ct)
     {
-        var outcome = await _agentService.ProcessClaimAsync(id, DescribeTrigger($"POST /api/agent/claims/{id}/process"), User.ToCallerIdentity(), ct);
+        // Phase 13 (docs/plan-agents.md §3 decision 2): runs the multi-agent "Process Claim"
+        // workflow (Worker/Claims/Risk & Escalation/Notification specialists) instead of one
+        // monolithic agent call - see WorkflowExecutionService.ProcessClaimAsync.
+        var outcome = await _workflowExecutionService.ProcessClaimAsync(id, DescribeTrigger($"POST /api/agent/claims/{id}/process"), User.ToCallerIdentity(), ct);
 
         switch (outcome.Status)
         {
@@ -52,7 +64,8 @@ public class AgentController : ControllerBase
             result.Claim.Id,
             result.Run.FinalAnswer,
             result.Claim.Status.ToString(),
-            result.QueuedActions.Select(ToDto).ToList());
+            result.QueuedActions.Select(ToDto).ToList(),
+            result.Steps.Select(s => new AgentRunStepDto(s.AgentName, ToDto(s.Run))).ToList());
 
         return Ok(response);
     }

@@ -15,6 +15,7 @@ public class WorkflowRunRepository : IWorkflowRunRepository
         await _db.WorkflowRuns.AsNoTracking()
             .Include(r => r.WorkflowDefinition)
             .Include(r => r.AgentRunLog)
+            .Include(r => r.Steps).ThenInclude(s => s.AgentRunLog)
             .OrderByDescending(r => r.CreatedAtUtc)
             .ToListAsync(ct);
 

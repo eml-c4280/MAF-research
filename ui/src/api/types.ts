@@ -82,7 +82,13 @@ export interface AgentRunLogDto {
   outcome: AgentRunOutcome;
 }
 
-export type PendingActionType = "SendWorkerEmail" | "SendEscalationEmail" | "CalculatePayout";
+export type PendingActionType =
+  | "SendWorkerEmail"
+  | "SendEscalationEmail"
+  | "CalculatePayout"
+  // Phase 13 (docs/plan-agents.md §2/§5): queued exclusively by the Notification Agent, never
+  // the Claims Agent - notifies the worker's assigned case manager with a status summary.
+  | "NotifyCaseManager";
 export type PendingActionStatus =
   | "AwaitingApproval"
   | "Approved"
@@ -110,12 +116,30 @@ export interface PendingActionDto {
   ruleOutputsJson: string | null;
 }
 
+// Phase 13 (docs/plan-agents.md §8): one entry per specialist agent that ran as part of a
+// multi-step pipeline (e.g. "Process Claim"'s Claims/Risk & Escalation/Notification agents).
+export interface AgentRunStepDto {
+  agentName: string;
+  run: AgentRunLogDto;
+}
+
 export interface ProcessClaimResponse {
+  // The final step's run - kept for backward compatibility with anything reading "the answer"
+  // off this response. See `steps` below for the full per-specialist pipeline breakdown.
   run: AgentRunLogDto;
   claimId: number;
   recommendation: string;
   claimStatus: string;
   queuedActions: PendingActionDto[];
+  steps: AgentRunStepDto[];
+}
+
+// Phase 13 (docs/plan-agents.md §2/§8): the fixed catalog of specialist agents, discoverable via
+// GET /api/agents and queryable individually via POST /api/agents/{name}/query.
+export interface AgentCatalogEntryDto {
+  name: string;
+  displayName: string;
+  toolNames: string[];
 }
 
 export type ConversationSessionStatus = "Active" | "Archived";
@@ -194,6 +218,7 @@ export const KNOWN_TOOL_NAMES = [
   "WorkerEmailSender",
   "EscalationEmailSender",
   "PayoutCalculator",
+  "CaseManagerNotifier",
 ] as const;
 
 export interface WorkflowRunDto {

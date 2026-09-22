@@ -107,6 +107,27 @@ export function ClaimsListPage() {
           </p>
 
           <h3 className="mt-5 text-sm font-semibold text-slate-900">
+            Pipeline ({result.steps.length} specialist agent{result.steps.length === 1 ? "" : "s"})
+          </h3>
+          <p className="mt-1 text-sm text-slate-500">
+            Processing a claim runs a fixed sequence of specialist agents, not one monolithic call
+            - each row below is one agent's own run, in order.
+          </p>
+          <ol className="mt-2 space-y-2">
+            {result.steps.map((s, i) => (
+              <li key={s.run.id} className="rounded-md border border-slate-200 p-3">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-semibold text-slate-400">{i + 1}.</span>
+                  <span className="text-sm font-medium text-slate-900">{s.agentName}</span>
+                  <span className={outcomeBadgeClasses(s.run.outcome)}>{s.run.outcome}</span>
+                  <span className="text-xs text-slate-400">{s.run.toolCallCount} tool call(s)</span>
+                </div>
+                <p className="mt-1.5 whitespace-pre-wrap text-sm text-slate-700">{s.run.finalAnswer}</p>
+              </li>
+            ))}
+          </ol>
+
+          <h3 className="mt-5 text-sm font-semibold text-slate-900">
             Queued actions ({result.queuedActions.length})
           </h3>
           {result.queuedActions.length === 0 ? (
@@ -125,7 +146,7 @@ export function ClaimsListPage() {
             </ul>
           )}
 
-          <h3 className="mt-5 text-sm font-semibold text-slate-900">Run details</h3>
+          <h3 className="mt-5 text-sm font-semibold text-slate-900">Final step run details</h3>
           <table className="mt-2 text-sm">
             <tbody>
               <tr>

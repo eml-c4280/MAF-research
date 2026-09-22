@@ -23,6 +23,7 @@
 13. [Agent hardening & reliability (gap remediation)](#13-agent-hardening--reliability-gap-remediation)
 14. [Conversation sessions (multi-turn chat)](#14-conversation-sessions-multi-turn-chat)
 15. [Implementation checklist](#15-implementation-checklist) — phase-by-phase build history
+16. [Multi-agent architecture & cross-agent workflows](#16-multi-agent-architecture--cross-agent-workflows-see-docsplan-agentsmd) (see `docs/plan-agents.md`)
 - [Change Log](#change-log) — dated log of every requirement/architecture change
 
 ## 1. Overview
@@ -1030,6 +1031,31 @@ oversight, revisit if that gap matters later). (The UI and `README.md`/`docs/` g
 when this phase first landed were since closed in follow-up passes - see this phase's checklist
 items and the later Change Log entries below.)
 
+### Phase 13 — Multi-Agent Architecture & Cross-Agent Workflows — 🟡 Planned, not started
+
+Full design in [`docs/plan-agents.md`](plan-agents.md) rather than inline here, same relationship
+this file has to `docs/plan-ui.md`/`docs/business-logic.md` — it's a large enough addition to
+warrant its own document. One-paragraph summary: AgentCore moves from one hardcoded agent to a
+catalog of four specialists (`ClaimsAgent`, `WorkerManagementAgent`, `RiskEscalationAgent`,
+`NotificationAgent` - the last two new), plus a workflow engine extended to chain them in a fixed,
+Admin-authored sequence (not adaptive planning - see `docs/plan-agents.md` §4 for why that
+distinction is deliberate). Two decisions the user made while this was still a plan: sensitive/
+notification tools move to `NotificationAgent` exclusively, and `POST /api/agent/claims/{id}/process`
+gets reimplemented to run the new multi-step "Process Claim" workflow rather than a single-agent
+call. `docs/plan-agents.md` §14 has the full implementation checklist - nothing in it is built yet.
+
+## 16. Multi-agent architecture & cross-agent workflows (see `docs/plan-agents.md`)
+
+A second specialist-agent catalog and a workflow engine that chains them, planned and implemented
+per its own document, [`docs/plan-agents.md`](plan-agents.md), rather than inline here — same
+relationship this file has to `docs/plan-ui.md`/`docs/business-logic.md`. **Done** (Phase 13,
+built in four sub-phases and verified end to end against the real running stack). See
+`docs/plan-agents.md` for the full design - agent catalog and tool ownership (§2-3), the
+fixed-pipeline orchestration model and why it deliberately isn't adaptive planning (§4),
+entity/API changes (§5, §8), the two redesigned/new built-in workflows (§9-10), what's explicitly
+deferred (§11), and its §14 for the full verification checklist plus a known reliability
+limitation of the "Worker Claim Assistance" workflow against this project's small local model.
+
 ## Change Log
 
 - **2026-09-18** — Initial plan created and written to `docs/plan.md`.
@@ -1573,3 +1599,49 @@ items and the later Change Log entries below.)
   was reversed by this same Phase 12, and one illustrative code sample's `[Description]` text and
   `PendingActionRef` shape had drifted from the real current file) - annotated as superseded
   rather than rewritten, to preserve the historical narrative those sections are there to record.
+- **2026-09-22** — The user asked for AgentCore to move from a single agent to multiple
+  specialist agents (naming Claims, Worker Management, and Notification as examples, explicitly
+  inviting a recommendation for more) plus a workflow engine that chains them together, and asked
+  for a restructuring recommendation if one was needed. Wrote the full design as
+  `docs/plan-agents.md` (Phase 13) rather than implementing directly, per the user's own "write
+  plan to implement first" instruction - the same pattern Phase 12 followed. Recommended a
+  fourth agent (`RiskEscalationAgent`, splitting escalation/fraud-risk evaluation out as its own
+  specialist concern) alongside the three requested, with reasoning recorded for what was
+  considered and *not* added (a Policy/Coverage agent, a Reporting agent, an admin-data-entry
+  agent). Asked the user to resolve two decisions that materially shape the design before writing
+  it: whether sensitive/notification tools belong to `NotificationAgent` exclusively (chosen: yes)
+  and whether `POST /api/agent/claims/{id}/process` should be reimplemented to run the new
+  multi-step workflow (chosen: yes). Recommended keeping the orchestration model a fixed,
+  Admin-authored pipeline - explicitly not the adaptive-planning/agent-delegation patterns
+  `docs/knowledge-base.md` Topics 10-11 already documented as deliberately unimplemented in this
+  project - and recommended no new deployable processes/projects, reasoning through why the
+  existing `mcp/ClaimsToolsServer`/`AgentCore.Agents` split already has enough room for four
+  agents without a new process being justified. Nothing implemented yet - awaiting review.
+- **2026-09-22** — Phase 13 implemented in four sub-phases at the user's request to work
+  incrementally ("break it smaller phase and work step by step"), each verified before the next
+  began: **13a** (foundation - `AgentDefinition`/`AgentCatalog`'s four specialists,
+  `NotifyCaseManagerTool`, `AgentFactory` generalized from the old single-agent factory, all
+  additive/no behavior change); **13b** (the multi-step workflow engine -
+  `WorkflowStepDefinition`/`WorkflowRunStep` entities + migration, placeholder resolution across a
+  running context dictionary, one `AgentRunLog` per pipeline step, fail-fast on any step's
+  denial); **13c** (API surface - `GET /api/agents`, `POST /api/agents/{agentName}/query`,
+  `/api/agent/claims/{id}/process` reimplemented to run the redesigned 3-step "Process Claim"
+  workflow, "Worker Claim Assistance" seeded as a new 4-step workflow); **13d** (observability -
+  `agent_name` tag on the run metrics; `mcp/ClaimsToolsServer/Tools/` reorganized into domain
+  subfolders, confirmed a pure reorg; full end-to-end verification against the real stack). That
+  verification both confirmed the redesigned "Process Claim" workflow works correctly and
+  repeatably, and surfaced two genuine structural tool gaps that were fixed as a direct result -
+  `ClaimsSearcher` never exposed a claim's numeric `Id` (only `ClaimNumber`), and had no way to
+  scope a search to one worker (forcing the model to self-match a worker's row out of an
+  industry-wide list, which it got wrong at least once, queuing a real `PendingAction` against a
+  different worker's claim - caught and rejected during this verification, before it could be
+  approved). Even after both fixes, the newer "Worker Claim Assistance" workflow - which requires
+  the Claims Agent to autonomously discover the right claim rather than being handed a claim Id
+  directly - proved measurably less reliable against this project's small local model
+  (`qwen3:0.6b`) across several more live runs (skipping a required tool call; matching only one
+  of two instructed statuses; one step fabricating "0 claims recorded" instead of calling a tool,
+  causing the next step to time out). This is recorded in `docs/plan-agents.md` §14 as an accepted
+  characteristic of the small local model, not a code defect - in every one of these failures, the
+  system's core safety invariant held: no bad or fabricated action was ever left able to execute
+  without a human approving it first. Full details, including exact code/prompt changes and each
+  verification run's outcome, in `docs/plan-agents.md` (status updated to Done).

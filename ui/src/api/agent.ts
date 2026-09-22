@@ -1,5 +1,6 @@
 import { apiClient } from "./client";
 import type {
+  AgentCatalogEntryDto,
   AgentRunLogDto,
   ConversationSessionDto,
   ConversationSessionMessagesResponse,
@@ -11,6 +12,14 @@ export const agentApi = {
     apiClient.post<AgentRunLogDto>("/api/agent/query", { prompt }).then((r) => r.data),
   processClaim: (claimId: number) =>
     apiClient.post<ProcessClaimResponse>(`/api/agent/claims/${claimId}/process`).then((r) => r.data),
+};
+
+// Phase 13 (docs/plan-agents.md §8) - the specialist agent catalog. Query is always read-only
+// regardless of which agent is asked, same guarantee agentApi.query has always made.
+export const agentCatalogApi = {
+  list: () => apiClient.get<AgentCatalogEntryDto[]>("/api/agents").then((r) => r.data),
+  query: (agentName: string, prompt: string) =>
+    apiClient.post<AgentRunLogDto>(`/api/agents/${agentName}/query`, { prompt }).then((r) => r.data),
 };
 
 // Multi-turn chat (docs/plan.md §14) - distinct from agentApi.query's one-shot Q&A above.

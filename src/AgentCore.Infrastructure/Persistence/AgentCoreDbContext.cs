@@ -17,6 +17,8 @@ public class AgentCoreDbContext : DbContext
     public DbSet<ConversationSession> ConversationSessions => Set<ConversationSession>();
     public DbSet<WorkflowDefinition> WorkflowDefinitions => Set<WorkflowDefinition>();
     public DbSet<WorkflowRun> WorkflowRuns => Set<WorkflowRun>();
+    public DbSet<WorkflowStepDefinition> WorkflowStepDefinitions => Set<WorkflowStepDefinition>();
+    public DbSet<WorkflowRunStep> WorkflowRunSteps => Set<WorkflowRunStep>();
     public DbSet<User> Users => Set<User>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
@@ -134,6 +136,20 @@ public class AgentCoreDbContext : DbContext
             builder.Property(w => w.AllowedToolNamesJson).HasColumnType("nvarchar(max)").IsRequired();
             builder.Property(w => w.ChatTriggerHintsJson).HasColumnType("nvarchar(max)").IsRequired();
             builder.Property(w => w.CreatedByRole).HasMaxLength(20).IsRequired();
+
+            // Phase 13 (docs/plan-agents.md §5): an ordered sequence of specialist-agent steps -
+            // deleting the definition takes its steps with it, same as any other owned collection.
+            builder.HasMany(w => w.Steps)
+                .WithOne(s => s.WorkflowDefinition)
+                .HasForeignKey(s => s.WorkflowDefinitionId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<WorkflowStepDefinition>(builder =>
+        {
+            builder.Property(s => s.AgentName).HasMaxLength(100).IsRequired();
+            builder.Property(s => s.PromptTemplate).HasColumnType("nvarchar(max)").IsRequired();
+            builder.Property(s => s.OutputKey).HasMaxLength(100).IsRequired();
         });
 
         modelBuilder.Entity<WorkflowRun>(builder =>
@@ -151,6 +167,30 @@ public class AgentCoreDbContext : DbContext
                 .WithMany()
                 .HasForeignKey(r => r.AgentRunLogId)
                 .OnDelete(DeleteBehavior.Cascade);
+
+            // Phase 13 (docs/plan-agents.md §5): one audit row per executed step for a multi-agent
+            // run - deleting the run takes its step rows with it.
+            builder.HasMany(r => r.Steps)
+                .WithOne(s => s.WorkflowRun)
+                .HasForeignKey(s => s.WorkflowRunId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<WorkflowRunStep>(builder =>
+        {
+            builder.Property(s => s.AgentName).HasMaxLength(100).IsRequired();
+            builder.Property(s => s.OutputKey).HasMaxLength(100).IsRequired();
+            builder.Property(s => s.ResolvedPromptSnapshot).HasColumnType("nvarchar(max)").IsRequired();
+
+            // Restrict, not Cascade: WorkflowRun already cascades from AgentRunLog above (via its
+            // own AgentRunLogId FK) - a second cascade path from this FK to the same AgentRunLog
+            // table would be a multiple-cascade-paths error (SQL Server error 1785, the same class
+            // of error the User self-referencing FK hit in Phase 12, docs/plan.md §5). Moot in
+            // practice anyway - AgentRunLog rows are audit records, never deleted.
+            builder.HasOne(s => s.AgentRunLog)
+                .WithMany()
+                .HasForeignKey(s => s.AgentRunLogId)
+                .OnDelete(DeleteBehavior.Restrict);
         });
 
         modelBuilder.Entity<User>(builder =>

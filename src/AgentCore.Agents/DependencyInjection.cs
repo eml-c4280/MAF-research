@@ -19,7 +19,7 @@ public static class DependencyInjection
         services.AddSingleton<AgentToolsFactory>();
 
         services.AddSingleton<Compactions>();
-        services.AddScoped<WorkerClaimAgentFactory>();
+        services.AddScoped<AgentFactory>();
 
         return services;
     }

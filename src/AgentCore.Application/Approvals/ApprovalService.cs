@@ -127,6 +127,10 @@ public class ApprovalService
                 await ExecuteCalculatePayoutAsync(action, decidedByRole, decidedByName, ct);
                 break;
 
+            case PendingActionType.NotifyCaseManager:
+                await ExecuteNotifyCaseManagerAsync(action, ct);
+                break;
+
             default:
                 throw new NotSupportedException($"Unknown PendingActionType '{action.ActionType}'.");
         }
@@ -170,7 +174,16 @@ public class ApprovalService
         await _claims.UpdateAsync(claim, ct);
     }
 
+    private async Task ExecuteNotifyCaseManagerAsync(PendingAction action, CancellationToken ct)
+    {
+        var payload = JsonSerializer.Deserialize<CaseManagerNotificationPayload>(action.Payload, PayloadOptions)
+            ?? throw new InvalidOperationException($"PendingAction {action.Id} has no readable case-manager notification payload.");
+
+        await _emailSender.SendAsync(payload.RecipientEmail, payload.Subject, payload.Body, ct);
+    }
+
     private record EmailPayload(string Subject, string Body);
     private record EscalationPayload(string Reason, string Body);
     private record PayoutPayload(decimal ProposedAmount, string Justification);
+    private record CaseManagerNotificationPayload(string RecipientEmail, string Subject, string Body);
 }

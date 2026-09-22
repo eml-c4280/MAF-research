@@ -139,13 +139,115 @@ public static class AgentCoreDbSeeder
             new()
             {
                 Name = "Process Claim",
-                Description = "Runs the full deterministic claim-processing pipeline (coverage, escalation, risk) against one claim - equivalent to POST /api/agent/claims/{claimId}/process, which this workflow delegates to directly rather than a generic prompt template (claim processing has its own rule-integration a template can't express).",
+                Description = "Runs the full multi-agent claim-processing pipeline against one claim (docs/plan-agents.md §9): the Claims Agent investigates coverage/payout, the Risk & Escalation Agent evaluates escalation/fraud signals, then the Notification Agent tells the worker and their case manager the outcome. Equivalent to POST /api/agent/claims/{claimId}/process, which runs this exact workflow definition under the hood.",
                 InputSchemaJson = """[{"name":"claimId","type":"int","required":true,"description":"The Id of the claim to process."}]""",
-                PromptTemplate = "Process claim #{claimId} using the full deterministic rule pipeline (coverage, escalation, risk).",
-                AllowedToolNamesJson = """["WorkerInformationFetcher","ClaimsSearcher","WorkerClaimsHistoryFetcher","CoverageChecker","EscalationEvaluator","ClaimRiskScorer","WorkerEmailSender","EscalationEmailSender","PayoutCalculator"]""",
+                PromptTemplate = string.Empty,
+                AllowedToolNamesJson = "[]",
                 IsChatTriggerable = true,
                 ChatTriggerHintsJson = """["process claim","evaluate claim","review claim","assess claim"]""",
-                CreatedByRole = "Admin"
+                CreatedByRole = "Admin",
+                Steps =
+                [
+                    new WorkflowStepDefinition
+                    {
+                        StepIndex = 0,
+                        AgentName = "ClaimsAgent",
+                        OutputKey = "ClaimDecision",
+                        PromptTemplate =
+                            "Process claim #{claimId}. Coverage check (already computed - quote it, do not recompute or " +
+                            "second-guess it): {coverageSummary} Read the claim's description and the worker's history " +
+                            "yourself via your tools if useful, then report: (a) anything in the description inconsistent " +
+                            "with the structured data, (b) a plain-English summary a claims officer can act on, (c) a " +
+                            "recommendation (approve, decline, or escalate) consistent with the coverage result above - " +
+                            "never contradict it. If coverage passed, you may propose a payout via PayoutCalculator (it " +
+                            "computes its own amount, never supply one yourself); do not propose a payout if coverage failed."
+                    },
+                    new WorkflowStepDefinition
+                    {
+                        StepIndex = 1,
+                        AgentName = "RiskEscalationAgent",
+                        OutputKey = "RiskAssessment",
+                        PromptTemplate =
+                            "Claim #{claimId} has this assessment from the Claims Agent: {steps.ClaimDecision} " +
+                            "Escalation check (already computed - quote it): {escalationSummary} Automated risk flags " +
+                            "(already computed - quote them as evidence for a human, never as proof, never visible to the " +
+                            "worker): {riskSummary} Report whether this claim needs escalation and why, consistent with " +
+                            "the escalation result above - never contradict it."
+                    },
+                    new WorkflowStepDefinition
+                    {
+                        StepIndex = 2,
+                        AgentName = "NotificationAgent",
+                        OutputKey = "Notifications",
+                        PromptTemplate =
+                            "Claim #{claimId}'s outcome from the Claims Agent: {steps.ClaimDecision} Risk/escalation " +
+                            "assessment: {steps.RiskAssessment} Notify the worker of the outcome using WorkerEmailSender " +
+                            "with a clear, appropriate subject and body. Also notify their assigned case manager using " +
+                            "CaseManagerNotifier with a brief internal summary of the decision and any risk flags. If the " +
+                            "risk assessment says escalation is needed, use EscalationEmailSender instead."
+                    }
+                ]
+            },
+            new()
+            {
+                Name = "Worker Claim Assistance",
+                Description = "Starts from a worker rather than a specific claim (docs/plan-agents.md §10): the Worker Management Agent looks the worker up, the Claims Agent finds and assesses their most relevant claim, the Risk & Escalation Agent evaluates it, then the Notification Agent tells the worker and their case manager the outcome. The closer match to \"find this worker, check their claim, decide, notify\" - the four-agent example this whole feature was built around.",
+                InputSchemaJson = """[{"name":"workerId","type":"int","required":true,"description":"The Id of the worker whose claims need attention."}]""",
+                PromptTemplate = string.Empty,
+                AllowedToolNamesJson = "[]",
+                IsChatTriggerable = true,
+                ChatTriggerHintsJson = """["help this worker claim","assist worker with claim","worker claim assistance"]""",
+                CreatedByRole = "Admin",
+                Steps =
+                [
+                    new WorkflowStepDefinition
+                    {
+                        StepIndex = 0,
+                        AgentName = "WorkerManagementAgent",
+                        OutputKey = "WorkerSummary",
+                        PromptTemplate =
+                            "Look up worker {workerId} using your tools - confirm they exist, and summarize their record " +
+                            "(role, location, availability) and recent claims history (counts, types, any patterns)."
+                    },
+                    new WorkflowStepDefinition
+                    {
+                        StepIndex = 1,
+                        AgentName = "ClaimsAgent",
+                        OutputKey = "ClaimDecision",
+                        PromptTemplate =
+                            "Given this worker: {steps.WorkerSummary} Call ClaimsSearcher with worker='{workerId}' " +
+                            "and no status filter - passing worker='{workerId}' scopes the search to only this " +
+                            "worker's own claims server-side, so do not search without it and do not pick a claim " +
+                            "from any other worker. This returns a short list of just this worker's claims; from " +
+                            "it, pick the one still open (status Pending or UnderReview) - if more than one is " +
+                            "open, pick the most recent by date. Use the exact Id field ClaimsSearcher returns for " +
+                            "that claim, never the worker's numeric Code. If none of the results are Pending or " +
+                            "UnderReview, say so plainly rather than guessing a claim Id. Once you have the real " +
+                            "claim Id, check its coverage using CoverageChecker and compute a payout via " +
+                            "PayoutCalculator if eligible (it computes its own amount, never supply one yourself). " +
+                            "Give your assessment, stating the claim's exact Id as returned by ClaimsSearcher."
+                    },
+                    new WorkflowStepDefinition
+                    {
+                        StepIndex = 2,
+                        AgentName = "RiskEscalationAgent",
+                        OutputKey = "RiskAssessment",
+                        PromptTemplate =
+                            "Given this claim decision: {steps.ClaimDecision} Evaluate escalation and fraud/anomaly risk " +
+                            "for the claim referenced above using your tools. Report your assessment."
+                    },
+                    new WorkflowStepDefinition
+                    {
+                        StepIndex = 3,
+                        AgentName = "NotificationAgent",
+                        OutputKey = "Notifications",
+                        PromptTemplate =
+                            "Claim decision: {steps.ClaimDecision} Risk/escalation assessment: {steps.RiskAssessment} " +
+                            "Notify the worker of the outcome and notify their assigned case manager with a summary, " +
+                            "using the claim Id referenced in the decision above. Use WorkerEmailSender and " +
+                            "CaseManagerNotifier (or EscalationEmailSender instead if escalation is needed)."
+                    }
+                ]
             },
             new()
             {

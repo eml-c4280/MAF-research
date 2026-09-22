@@ -9,16 +9,21 @@ using Microsoft.Extensions.Options;
 namespace AgentCore.Application.Workflows;
 
 /// <summary>
-/// Resolves a WorkflowDefinition's inputs, restricts the agent's tool set to
-/// AllowedToolNamesJson, fills the prompt template, and hands off to ClaimAgentService's existing
-/// run path unchanged - same PendingAction interception, same SignalR events, same AgentRunLog
-/// (docs/plan.md §11). A WorkflowRun row is written alongside purely as trigger metadata.
+/// Resolves a WorkflowDefinition's inputs and dispatches to one of three execution paths
+/// (docs/plan.md §11, docs/plan-agents.md §7 for the multi-agent additions):
 ///
-/// "Process Claim" is special-cased to delegate directly to
-/// ClaimAgentService.ProcessClaimAsync instead of the generic template-fill path below, since
-/// claim processing has its own deterministic rule-integration (CV/ES/FR pre-computation, the
-/// Disputed hard block, escalation-triggered tool restriction) that a generic prompt template
-/// can't express - see docs/plan.md §11 and Phase 8's checklist note on this decision.
+/// 1. **"Process Claim" by name** - delegates to ExecuteProcessClaimPipelineAsync, since claim
+///    processing has its own deterministic rule-integration (CV/ES/FR pre-computation, the
+///    Disputed hard block) a generic prompt template can't express.
+/// 2. **Any other definition with Steps** (Phase 13) - the generic multi-agent pipeline: each
+///    step names a specialist agent (AgentCatalog) and runs through ClaimAgentService.
+///    RunAgentPipelineAsync, one AgentRunLog per step.
+/// 3. **A definition with no Steps** (legacy, pre-Phase-13) - the original single-agent path:
+///    restricts one agent's tool set to AllowedToolNamesJson, fills the prompt template, hands off
+///    to ClaimAgentService's existing run path unchanged.
+///
+/// A WorkflowRun row (with WorkflowRunSteps for paths 1-2) is written alongside every path purely
+/// as trigger/audit metadata - same PendingAction interception, same SignalR events either way.
 /// </summary>
 public class WorkflowExecutionService
 {
@@ -30,22 +35,35 @@ public class WorkflowExecutionService
 
     private readonly IWorkflowDefinitionRepository _definitions;
     private readonly IWorkflowRunRepository _runs;
-    private readonly WorkerClaimAgentFactory _agentFactory;
+    private readonly IPendingActionRepository _pendingActions;
+    private readonly AgentFactory _agentFactory;
     private readonly ClaimAgentService _claimAgentService;
     private readonly AgentOptions _options;
 
     public WorkflowExecutionService(
         IWorkflowDefinitionRepository definitions,
         IWorkflowRunRepository runs,
-        WorkerClaimAgentFactory agentFactory,
+        IPendingActionRepository pendingActions,
+        AgentFactory agentFactory,
         ClaimAgentService claimAgentService,
         IOptions<AgentOptions> options)
     {
         _definitions = definitions;
         _runs = runs;
+        _pendingActions = pendingActions;
         _agentFactory = agentFactory;
         _claimAgentService = claimAgentService;
         _options = options.Value;
+    }
+
+    /// <summary>The dedicated entry point POST /api/agent/claims/{id}/process now calls (Phase
+    /// 13, docs/plan-agents.md §3 decision 2) - runs the same "Process Claim" pipeline the
+    /// name-special-cased branch of RunAsync below uses, just without a WorkflowDefinitionId/raw
+    /// inputs dictionary to resolve first.</summary>
+    public async Task<ClaimProcessingOutcome> ProcessClaimAsync(int claimId, string trigger, CallerIdentity caller, CancellationToken ct = default)
+    {
+        var (outcome, _) = await ExecuteProcessClaimPipelineAsync(claimId, trigger, caller, ct);
+        return outcome;
     }
 
     public Task<IReadOnlyList<WorkflowDefinition>> ListDefinitionsAsync(CancellationToken ct = default) =>
@@ -87,7 +105,7 @@ public class WorkflowExecutionService
             }
         }
 
-        var fallbackRun = await _claimAgentService.QueryAsync(chatText, trigger, caller, ct);
+        var fallbackRun = await _claimAgentService.QueryAsync(AgentCatalog.ClaimsAgent, chatText, trigger, caller, ct);
         return new WorkflowChatOutcome(FellBackToQuery: true, WorkflowResult: null, fallbackRun);
     }
 
@@ -114,27 +132,104 @@ public class WorkflowExecutionService
                 return WorkflowRunOutcome.ValidationErrorResult("claimId is required and must be an integer.");
             }
 
-            var processingOutcome = await _claimAgentService.ProcessClaimAsync(claimId, trigger, caller, ct);
+            var (processingOutcome, workflowRun) = await ExecuteProcessClaimPipelineAsync(claimId, trigger, caller, ct);
             return processingOutcome.Status switch
             {
                 ClaimProcessingStatus.NotFound => WorkflowRunOutcome.NotFoundResult($"No claim found with Id {claimId}."),
                 ClaimProcessingStatus.Blocked => WorkflowRunOutcome.BlockedResult(processingOutcome.BlockReason!),
                 ClaimProcessingStatus.Forbidden => WorkflowRunOutcome.ForbiddenResult(processingOutcome.BlockReason!),
-                _ => await RecordRunAsync(definition, resolved, processingOutcome.Result!.Run, source, rawChatInput, matchConfidence, ct)
+                _ => WorkflowRunOutcome.CompletedResult(definition, workflowRun!, processingOutcome.Result!.Run)
             };
+        }
+
+        int? claimIdForRun = resolved.TryGetValue("claimId", out var cid) && int.TryParse(cid, out var parsedClaimId)
+            ? parsedClaimId
+            : null;
+
+        if (definition.Steps.Count > 0)
+        {
+            var pipelineResults = await _claimAgentService.RunAgentPipelineAsync(definition.Steps, resolved, trigger, claimIdForRun, caller, ct);
+            var multiStepRun = BuildWorkflowRun(definition, resolved, pipelineResults, source, rawChatInput, matchConfidence);
+            await _runs.AddAsync(multiStepRun, ct);
+            multiStepRun.WorkflowDefinition = definition;
+            return WorkflowRunOutcome.CompletedResult(definition, multiStepRun, pipelineResults[^1].Run);
         }
 
         var prompt = FillTemplate(definition.PromptTemplate, resolved);
         var allowedToolNames = JsonSerializer.Deserialize<HashSet<string>>(definition.AllowedToolNamesJson) ?? [];
         var agent = await _agentFactory.CreateWorkflowAgentAsync(allowedToolNames, caller, ct);
 
-        int? claimIdForRun = resolved.TryGetValue("claimId", out var cid) && int.TryParse(cid, out var parsedClaimId)
-            ? parsedClaimId
-            : null;
-
-        var run = await _claimAgentService.RunWithCustomAgentAsync(agent, prompt, trigger, claimIdForRun, ct);
+        // Not an AgentCatalog specialist - a synthesized agent for a legacy, pre-Phase-13
+        // workflow with no Steps. "LegacyWorkflowAgent" tags it distinctly in Grafana rather than
+        // overloading any catalog agent's name for something that isn't actually that specialist.
+        var run = await _claimAgentService.RunWithCustomAgentAsync(agent, prompt, trigger, claimIdForRun, ct, agentName: "LegacyWorkflowAgent");
         return await RecordRunAsync(definition, resolved, run, source, rawChatInput, matchConfidence, ct);
     }
+
+    /// <summary>Shared by RunAsync's "Process Claim"-by-name special case and the dedicated
+    /// ProcessClaimAsync entry point (docs/plan-agents.md §3 decision 2), so both paths run the
+    /// identical pipeline and produce the identical WorkflowRun/WorkflowRunStep audit trail -
+    /// they differ only in how they arrived at a claimId.</summary>
+    private async Task<(ClaimProcessingOutcome Outcome, WorkflowRun? WorkflowRun)> ExecuteProcessClaimPipelineAsync(
+        int claimId, string trigger, CallerIdentity caller, CancellationToken ct)
+    {
+        var prep = await _claimAgentService.PrepareClaimForProcessingAsync(claimId, caller, ct);
+        if (prep.Claim is null || prep.InitialContext is null)
+        {
+            return (new ClaimProcessingOutcome(prep.Status, prep.BlockReason, null), null);
+        }
+
+        var definitions = await _definitions.GetAllAsync(ct);
+        var definition = definitions.FirstOrDefault(d => d.Name == ProcessClaimWorkflowName && d.IsActive);
+        if (definition is null || definition.Steps.Count == 0)
+        {
+            return (new ClaimProcessingOutcome(
+                ClaimProcessingStatus.NotFound, $"The '{ProcessClaimWorkflowName}' workflow is not configured with any steps.", null), null);
+        }
+
+        var pipelineResults = await _claimAgentService.RunAgentPipelineAsync(
+            definition.Steps, prep.InitialContext, trigger, claimId, caller, ct);
+
+        var workflowRun = BuildWorkflowRun(
+            definition, new Dictionary<string, string> { ["claimId"] = claimId.ToString() },
+            pipelineResults, WorkflowTriggerSource.Structured, rawChatInput: null, matchConfidence: null);
+        await _runs.AddAsync(workflowRun, ct);
+        workflowRun.WorkflowDefinition = definition;
+
+        var claimDecisionText = pipelineResults.FirstOrDefault(r => r.Step.OutputKey == "ClaimDecision")?.Run.FinalAnswer
+            ?? pipelineResults[^1].Run.FinalAnswer;
+        await _claimAgentService.ApplyClaimDecisionAsync(prep.Claim, claimDecisionText, ct);
+
+        var queuedActions = new List<PendingAction>();
+        foreach (var stepResult in pipelineResults)
+        {
+            queuedActions.AddRange(await _pendingActions.GetByAgentRunIdAsync(stepResult.Run.Id, ct));
+        }
+
+        var stepSummaries = pipelineResults.Select(r => new ClaimProcessingStepResult(r.Step.AgentName, r.Run)).ToList();
+        var result = new ClaimProcessingResult(pipelineResults[^1].Run, prep.Claim, queuedActions, stepSummaries);
+        return (new ClaimProcessingOutcome(ClaimProcessingStatus.Completed, null, result), workflowRun);
+    }
+
+    private static WorkflowRun BuildWorkflowRun(
+        WorkflowDefinition definition, Dictionary<string, string> resolvedInputs, List<PipelineStepResult> pipelineResults,
+        WorkflowTriggerSource source, string? rawChatInput, double? matchConfidence) => new()
+    {
+        WorkflowDefinitionId = definition.Id,
+        AgentRunLogId = pipelineResults[^1].Run.Id,
+        InputValuesJson = JsonSerializer.Serialize(resolvedInputs),
+        TriggerSource = source,
+        RawChatInput = rawChatInput,
+        MatchConfidence = matchConfidence,
+        Steps = pipelineResults.Select(r => new WorkflowRunStep
+        {
+            StepIndex = r.Step.StepIndex,
+            AgentName = r.Step.AgentName,
+            AgentRunLogId = r.Run.Id,
+            OutputKey = r.Step.OutputKey,
+            ResolvedPromptSnapshot = r.ResolvedPrompt
+        }).ToList()
+    };
 
     private async Task<WorkflowRunOutcome> RecordRunAsync(
         WorkflowDefinition definition, Dictionary<string, string> resolved, AgentRunLog run,
@@ -234,7 +329,8 @@ public class WorkflowExecutionService
 
         try
         {
-            var agent = await _agentFactory.CreateReadOnlyAgentAsync(caller, timeoutCts.Token);
+            var agent = await _agentFactory.CreateAgentAsync(
+                AgentCatalog.GetByName(AgentCatalog.ClaimsAgent), caller, timeoutCts.Token, includeSensitiveTools: false);
             var response = await agent.RunAsync(intentPrompt, cancellationToken: timeoutCts.Token);
             return ParseIntentResponse(response.Text ?? string.Empty);
         }

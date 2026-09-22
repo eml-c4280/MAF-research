@@ -40,4 +40,9 @@ public record ProcessClaimResponse(
     int ClaimId,
     string Recommendation,
     string ClaimStatus,
-    IReadOnlyList<PendingActionDto> QueuedActions);
+    IReadOnlyList<PendingActionDto> QueuedActions,
+    /// <summary>Phase 13 (docs/plan-agents.md §8): one entry per specialist agent that ran as
+    /// part of processing this claim - Run above stays "the final step's answer" for compatibility.</summary>
+    IReadOnlyList<AgentRunStepDto> Steps);
+
+public record AgentRunStepDto(string AgentName, AgentRunLogDto Run);

@@ -22,15 +22,9 @@ public class ClaimAgentService
     // Used here to know which tool results carry a PendingActionRef to backfill - see section 4
     // of docs/plan-mcp.md for why the tool itself can't stamp ProposedByAgentRunId anymore.
     private static readonly HashSet<string> SensitiveToolNames =
-        ["WorkerEmailSender", "EscalationEmailSender", "PayoutCalculator"];
+        ["WorkerEmailSender", "EscalationEmailSender", "PayoutCalculator", "CaseManagerNotifier"];
 
-    /// <summary>Dropped from the claim-processing agent's toolset for a run where
-    /// EscalationEvaluator triggered (docs/business-logic.md §5) - only EscalationEmailSender
-    /// stays available among sensitive tools, forcing the agent toward escalation.</summary>
-    private static readonly HashSet<string> RestrictedToolNamesOnEscalation =
-        ["PayoutCalculator", "WorkerEmailSender"];
-
-    private readonly WorkerClaimAgentFactory _agentFactory;
+    private readonly AgentFactory _agentFactory;
     private readonly IAgentRunLogRepository _runLogs;
     private readonly IPendingActionRepository _pendingActions;
     private readonly IClaimRepository _claims;
@@ -42,7 +36,7 @@ public class ClaimAgentService
     private readonly ILogger<ClaimAgentService> _logger;
 
     public ClaimAgentService(
-        WorkerClaimAgentFactory agentFactory,
+        AgentFactory agentFactory,
         IAgentRunLogRepository runLogs,
         IPendingActionRepository pendingActions,
         IClaimRepository claims,
@@ -65,13 +59,18 @@ public class ClaimAgentService
         _logger = logger;
     }
 
-    /// <summary>Free-form Q&amp;A using only auto (read-only) tools - no claim context, no sensitive actions.
-    /// <paramref name="caller"/> is asserted to mcp/ClaimsToolsServer (docs/plan.md section 5, OBO)
-    /// so its tools enforce the same row-level permission a CaseManager is bound by everywhere else.</summary>
-    public async Task<AgentRunLog> QueryAsync(string prompt, string trigger, CallerIdentity caller, CancellationToken ct = default)
+    /// <summary>Free-form Q&amp;A against a named specialist (Phase 13, docs/plan-agents.md §8) -
+    /// always read-only regardless of which agent is asked (includeSensitiveTools: false), the
+    /// same way this endpoint never let the model act even before there was more than one agent
+    /// to pick from. <paramref name="caller"/> is asserted to mcp/ClaimsToolsServer (docs/plan.md
+    /// section 5, OBO) so its tools enforce the same row-level permission a CaseManager is bound
+    /// by everywhere else. Throws KeyNotFoundException for an unknown agentName - the controller
+    /// translates that to 404.</summary>
+    public async Task<AgentRunLog> QueryAsync(string agentName, string prompt, string trigger, CallerIdentity caller, CancellationToken ct = default)
     {
-        var agent = await _agentFactory.CreateReadOnlyAgentAsync(caller, ct);
-        return await ExecuteRunAsync("query", prompt, trigger, claimId: null, agent, ct);
+        var definition = AgentCatalog.GetByName(agentName);
+        var agent = await _agentFactory.CreateAgentAsync(definition, caller, ct, includeSensitiveTools: false);
+        return await ExecuteRunAsync($"query:{agentName}", prompt, trigger, claimId: null, agent, ct, agentName: agentName);
     }
 
     /// <summary>Runs an already-built agent (docs/plan.md §11 - `WorkflowExecutionService` builds
@@ -79,15 +78,16 @@ public class ClaimAgentService
     /// observability/approval-backfill path every other run goes through - same `PendingAction`
     /// interception, same SignalR events, same `AgentRunLog`. Not for session-aware calls (there's
     /// no session-state persistence step here) - use `ContinueSessionAsync` for those.</summary>
-    public Task<AgentRunLog> RunWithCustomAgentAsync(AIAgent agent, string prompt, string trigger, int? claimId, CancellationToken ct = default) =>
-        ExecuteRunAsync("workflow", prompt, trigger, claimId, agent, ct);
+    public Task<AgentRunLog> RunWithCustomAgentAsync(
+        AIAgent agent, string prompt, string trigger, int? claimId, CancellationToken ct = default, string? agentName = null) =>
+        ExecuteRunAsync("workflow", prompt, trigger, claimId, agent, ct, agentName: agentName);
 
     /// <summary>Starts a new, empty multi-turn chat session (docs/plan.md section 14) - read-only
     /// tools only, same as QueryAsync. Persists the framework's own (empty) serialized session
     /// state immediately so ContinueSessionAsync always has something to deserialize.</summary>
     public async Task<ConversationSession> StartSessionAsync(string createdByRole, string createdByName, CallerIdentity caller, CancellationToken ct = default)
     {
-        var agent = await _agentFactory.CreateReadOnlyAgentAsync(caller, ct);
+        var agent = await _agentFactory.CreateAgentAsync(AgentCatalog.GetByName(AgentCatalog.ClaimsAgent), caller, ct, includeSensitiveTools: false);
         var agentSession = await agent.CreateSessionAsync(ct);
         var state = await agent.SerializeSessionAsync(agentSession, cancellationToken: ct);
 
@@ -112,13 +112,13 @@ public class ClaimAgentService
             return null;
         }
 
-        var agent = await _agentFactory.CreateReadOnlyAgentAsync(caller, ct);
+        var agent = await _agentFactory.CreateAgentAsync(AgentCatalog.GetByName(AgentCatalog.ClaimsAgent), caller, ct, includeSensitiveTools: false);
         var stateElement = JsonDocument.Parse(session.SerializedStateJson).RootElement;
         var agentSession = await agent.DeserializeSessionAsync(stateElement, cancellationToken: ct);
 
         var run = await ExecuteRunAsync(
             "query-session", message, trigger, claimId: null, agent, ct,
-            session: agentSession, conversationSessionId: session.Id);
+            session: agentSession, conversationSessionId: session.Id, agentName: AgentCatalog.ClaimsAgent);
 
         return new ConversationTurnResult(run, session);
     }
@@ -141,37 +141,39 @@ public class ClaimAgentService
         return new ConversationSessionMessagesResult(session, turns);
     }
 
-    /// <summary>Evaluates a specific claim: runs the deterministic CV/ES/FR rule engines first
-    /// (docs/business-logic.md §4 - "rules decide, the agent explains"), then has the agent read
-    /// the description/history and produce a recommendation quoting those results, queuing any
-    /// sensitive action (email, escalation, payout - the payout amount itself always rule-computed,
-    /// never model-supplied) for human approval. Hard-blocks a Disputed claim outright (§3) rather
-    /// than running the agent at all.</summary>
-    public async Task<ClaimProcessingOutcome> ProcessClaimAsync(int claimId, string trigger, CallerIdentity caller, CancellationToken ct = default)
+    /// <summary>Phase 13 (docs/plan-agents.md §7): pre-flight checks (NotFound/Forbidden/Disputed,
+    /// unchanged from before) plus the deterministic CV/ES/FR rule computation
+    /// (docs/business-logic.md §4 - "rules decide, the agent explains"), resolved once into an
+    /// initial context dictionary every step of the "Process Claim" pipeline can draw on. Does
+    /// NOT run any agent itself - that's RunAgentPipelineAsync, called separately by
+    /// WorkflowExecutionService.ProcessClaimAsync so the permission/rule-computation half stays
+    /// here (where the Claim/Worker/Policy repositories already are) while the pipeline-execution
+    /// half stays where the WorkflowRun/WorkflowRunStep audit rows are written.</summary>
+    public async Task<ClaimProcessingPrep> PrepareClaimForProcessingAsync(int claimId, CallerIdentity caller, CancellationToken ct = default)
     {
         var claim = await _claims.GetByIdAsync(claimId, ct);
         if (claim is null)
         {
-            return new ClaimProcessingOutcome(ClaimProcessingStatus.NotFound, null, null);
+            return new ClaimProcessingPrep(ClaimProcessingStatus.NotFound, null, null, null);
         }
 
         var worker = await _workers.GetByIdAsync(claim.WorkerId, ct);
         if (worker is null || !WorkerAccessPolicy.CanAccessWorker(worker, caller.Roles, caller.UserId))
         {
             _logger.LogInformation("Agent run denied for claim {ClaimId}: caller {UserId} lacks permission for worker {WorkerId}", claimId, caller.UserId, claim.WorkerId);
-            return new ClaimProcessingOutcome(
+            return new ClaimProcessingPrep(
                 ClaimProcessingStatus.Forbidden,
                 $"You do not have permission to process claim #{claimId} - its worker is not assigned to you.",
-                null);
+                null, null);
         }
 
         if (claim.Status == ClaimStatus.Disputed)
         {
             _logger.LogInformation("Agent run blocked for claim {ClaimId}: status is Disputed", claimId);
-            return new ClaimProcessingOutcome(
+            return new ClaimProcessingPrep(
                 ClaimProcessingStatus.Blocked,
                 $"Claim #{claimId} is Disputed - agent runs are blocked outright once a matter is contested (docs/business-logic.md §3), not just discouraged.",
-                null);
+                null, null);
         }
 
         var policy = await _policies.GetByWorkerIdAsync(claim.WorkerId, ct);
@@ -182,63 +184,95 @@ public class ClaimAgentService
         var risk = ClaimRiskScorer.Score(claim, history);
 
         // CV is rule-decided and terminal - the status transition doesn't wait on, or depend on,
-        // what the agent does with this information (docs/business-logic.md §3).
+        // what any agent does with this information (docs/business-logic.md §3). Not persisted
+        // yet - ApplyClaimDecisionAsync saves the claim once, after the pipeline completes.
         if (!coverage.Passed && claim.Status is ClaimStatus.Pending or ClaimStatus.UnderReview)
         {
             claim.Status = ClaimStatus.CoverageRejected;
         }
 
-        var prompt = BuildClaimProcessingPrompt(claim, coverage, escalation, risk);
+        var initialContext = new Dictionary<string, string>
+        {
+            ["claimId"] = claimId.ToString(),
+            ["coverageSummary"] = BuildCoverageSummary(coverage),
+            ["escalationSummary"] = BuildEscalationSummary(escalation),
+            ["riskSummary"] = BuildRiskSummary(risk)
+        };
 
-        var agent = escalation.Triggered
-            ? await _agentFactory.CreateClaimProcessingAgentAsync(caller, ct, RestrictedToolNamesOnEscalation)
-            : await _agentFactory.CreateClaimProcessingAgentAsync(caller, ct);
+        return new ClaimProcessingPrep(ClaimProcessingStatus.Completed, null, claim, initialContext);
+    }
 
-        var run = await ExecuteRunAsync("process-claim", prompt, trigger, claimId, agent, ct);
-
-        claim.AgentRecommendation = run.FinalAnswer;
+    /// <summary>The tail of what used to be ProcessClaimAsync's single-agent version: stamps the
+    /// claim with the pipeline's decision text and advances Pending -> UnderReview, then persists
+    /// once. Called after the whole pipeline completes, not per step.</summary>
+    public async Task ApplyClaimDecisionAsync(Claim claim, string claimDecisionText, CancellationToken ct = default)
+    {
+        claim.AgentRecommendation = claimDecisionText;
         if (claim.Status == ClaimStatus.Pending)
         {
             claim.Status = ClaimStatus.UnderReview;
         }
         await _claims.UpdateAsync(claim, ct);
-
-        var queuedActions = await _pendingActions.GetByAgentRunIdAsync(run.Id, ct);
-        return new ClaimProcessingOutcome(
-            ClaimProcessingStatus.Completed, null, new ClaimProcessingResult(run, claim, queuedActions));
     }
 
-    /// <summary>docs/business-logic.md §5's suggested prompt shape: rule results are handed to the
-    /// model as already-settled facts to quote, not something to re-derive or second-guess.</summary>
-    private static string BuildClaimProcessingPrompt(
-        Claim claim, CoverageValidationResult coverage, EscalationResult escalation, ClaimRiskResult risk)
+    /// <summary>Phase 13 (docs/plan-agents.md §7): runs a fixed, ordered sequence of specialist-
+    /// agent steps, each through the exact same ExecuteRunAsync path every other run goes through
+    /// (one AgentRunLog per step - just as fully audited as a standalone agent call). A step's
+    /// PromptTemplate may reference {input} placeholders from <paramref name="initialContext"/> or
+    /// {steps.OutputKey} placeholders from an earlier step's answer; each step's own answer is
+    /// stored under its OutputKey for whichever later step wants it.</summary>
+    public async Task<List<PipelineStepResult>> RunAgentPipelineAsync(
+        IReadOnlyList<WorkflowStepDefinition> steps, Dictionary<string, string> initialContext,
+        string trigger, int? claimId, CallerIdentity caller, CancellationToken ct = default)
     {
-        var coverageSummary = coverage.Passed
+        var context = new Dictionary<string, string>(initialContext);
+        var results = new List<PipelineStepResult>();
+
+        foreach (var step in steps.OrderBy(s => s.StepIndex))
+        {
+            var definition = AgentCatalog.GetByName(step.AgentName);
+            var resolvedPrompt = ResolveStepPlaceholders(step.PromptTemplate, context);
+            var agent = await _agentFactory.CreateAgentAsync(definition, caller, ct);
+            var stepRun = await RunWithCustomAgentAsync(agent, resolvedPrompt, trigger, claimId, ct, agentName: step.AgentName);
+
+            results.Add(new PipelineStepResult(step, stepRun, resolvedPrompt));
+            context[step.OutputKey] = stepRun.FinalAnswer;
+        }
+
+        return results;
+    }
+
+    /// <summary>Same blind string-replace WorkflowExecutionService.FillTemplate already uses for
+    /// top-level inputs, extended with a second placeholder namespace: {steps.X} resolves the same
+    /// way {X} does (both read from the one running context dictionary), it's just written that
+    /// way in a step's own PromptTemplate to make "this came from an earlier step" visually
+    /// explicit to whoever authors the workflow.</summary>
+    private static string ResolveStepPlaceholders(string template, Dictionary<string, string> context)
+    {
+        var result = template;
+        foreach (var (key, value) in context)
+        {
+            result = result.Replace("{" + key + "}", value).Replace("{steps." + key + "}", value);
+        }
+        return result;
+    }
+
+    /// <summary>docs/business-logic.md §5's suggested prompt shape: rule results are handed to
+    /// each step as already-settled facts to quote, not something to re-derive or second-guess.</summary>
+    private static string BuildCoverageSummary(CoverageValidationResult coverage) =>
+        coverage.Passed
             ? "COVERED. " + string.Join(" ", coverage.Details)
             : $"NOT COVERED ({coverage.RejectionReason}) - claim status has already been set to CoverageRejected. " + string.Join(" ", coverage.Details);
 
-        var escalationSummary = escalation.Triggered
-            ? $"TRIGGERED ({string.Join(", ", escalation.TriggeredRuleIds)}) -> route to the {escalation.Tier} tier. " +
-              "Sensitive tools are restricted to escalation only for this run - propose an escalation email, not a payout or a worker email."
+    private static string BuildEscalationSummary(EscalationResult escalation) =>
+        escalation.Triggered
+            ? $"TRIGGERED ({string.Join(", ", escalation.TriggeredRuleIds)}) -> route to the {escalation.Tier} tier."
             : "No escalation triggers.";
 
-        var riskSummary = risk.Flags.Count == 0
+    private static string BuildRiskSummary(ClaimRiskResult risk) =>
+        risk.Flags.Count == 0
             ? "No automated risk flags."
             : string.Join(" ", risk.Flags.Select(f => $"{f.RuleId}: {f.Evidence}"));
-
-        return
-            $"Process claim #{claim.Id} (ClaimNumber {claim.ClaimNumber}) for worker Id {claim.WorkerId}. " +
-            $"Claim type: {claim.ClaimType}, amount: {claim.Amount:C}, status: {claim.Status}, " +
-            $"incident date {claim.IncidentDate:yyyy-MM-dd}, reported {claim.ReportedDate:yyyy-MM-dd}, jurisdiction {claim.Jurisdiction}. " +
-            $"Description: {claim.Description} " +
-            $"Coverage check (already computed - quote it, do not recompute or second-guess it): {coverageSummary} " +
-            $"Escalation check (already computed - quote it): {escalationSummary} " +
-            $"Automated risk flags (already computed - quote them as evidence for a human, never as proof and never visible to the worker): {riskSummary} " +
-            "Now read the description and the worker's history yourself: report (a) anything in the description inconsistent with the structured data, " +
-            "(b) a plain-English summary a claims officer can act on, (c) a recommendation (approve, decline, or escalate) consistent with the coverage/escalation results above - never contradict them. " +
-            "If coverage passed and no escalation is triggered, you may propose a payout (PayoutCalculator computes the amount itself) or a worker email. " +
-            "If escalation is triggered, only propose an escalation email. If coverage failed, no payout can be proposed at all.";
-    }
 
     /// <summary>
     /// Runs one agent invocation end to end: persists the AgentRunLog first (so sensitive tools
@@ -247,7 +281,7 @@ public class ClaimAgentService
     /// </summary>
     private async Task<AgentRunLog> ExecuteRunAsync(
         string mode, string prompt, string trigger, int? claimId, AIAgent agent, CancellationToken ct,
-        AgentSession? session = null, int? conversationSessionId = null)
+        AgentSession? session = null, int? conversationSessionId = null, string? agentName = null)
     {
         var run = new AgentRunLog
         {
@@ -278,7 +312,7 @@ public class ClaimAgentService
         // the caller's own ct, so a model that stalls or the tool-call loop that never converges
         // can't hang the caller/a SignalR watcher indefinitely. The tool-call-count guard itself is
         // enforced inside the model call via FunctionInvokingChatClient.MaximumIterationsPerRequest
-        // (wired in WorkerClaimAgentFactory) - it can't be observed until the call returns, so it's
+        // (wired in AgentFactory) - it can't be observed until the call returns, so it's
         // detected here from the resulting ToolCallCount, not by cancelling anything.
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(_options.MaxRunDuration);
@@ -383,7 +417,10 @@ public class ClaimAgentService
         finally
         {
             stopwatch.Stop();
-            var tags = new TagList { { "mode", mode }, { "outcome", outcome } };
+            // Phase 13 (docs/plan-agents.md §12): agent_name lets Grafana break "which specialist
+            // is slow/failing" out by agent, not just by mode - "unknown" only for a call site
+            // that predates the agent catalog and hasn't supplied one (there shouldn't be any).
+            var tags = new TagList { { "mode", mode }, { "outcome", outcome }, { "agent_name", agentName ?? "unknown" } };
             AgentCoreDiagnostics.AgentRuns.Add(1, tags);
             AgentCoreDiagnostics.AgentRunDuration.Record(stopwatch.Elapsed.TotalSeconds, tags);
             _logger.LogInformation(

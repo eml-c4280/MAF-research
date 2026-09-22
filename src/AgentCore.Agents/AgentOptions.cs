@@ -21,7 +21,7 @@ public class AgentOptions
     /// <summary>Loop guard (docs/plan.md section 13): caps how many tool-call/response rounds a
     /// single agent.RunAsync call may go through before Microsoft.Extensions.AI's
     /// FunctionInvokingChatClient stops the loop on its own and returns whatever it has. Wired in
-    /// via WorkerClaimAgentFactory, not the framework's default (40), since a small local model
+    /// via AgentFactory, not the framework's default (40), since a small local model
     /// looping on tool selection should stop well short of that.</summary>
     public int MaxToolCallsPerRun { get; set; } = 8;
 

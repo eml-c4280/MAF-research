@@ -1,19 +1,46 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { agentSessionsApi } from "../../api/agent";
+import { agentCatalogApi, agentSessionsApi } from "../../api/agent";
 import { apiErrorMessage } from "../../api/client";
+import type { AgentRunLogDto } from "../../api/types";
 import { ErrorBanner } from "../../components/ErrorBanner";
 import { LoadingState } from "../../components/LoadingState";
 import { outcomeBadgeClasses } from "../../utils/badgeColors";
 
 /**
- * A real multi-turn chat thread (docs/plan.md §14) - distinct from the one-shot Q&A this page
- * used to be. Each session's history is carried server-side (the agent framework's own session
- * state, persisted and replayed by the backend); this page just lists sessions, shows one
- * session's turns (its AgentRunLogs, oldest first), and lets you send the next message or start
- * a new chat with no memory of the previous one.
+ * Two ways to talk to the agent: a multi-turn chat thread against the Claims Agent (docs/plan.md
+ * §14, history carried server-side), or a one-shot question to any specialist in the Phase 13
+ * catalog (docs/plan-agents.md §2/§8, no history between questions).
  */
 export function AgentQueryPage() {
+  const [mode, setMode] = useState<"chat" | "specialist">("chat");
+
+  return (
+    <div>
+      <div className="mb-4 flex gap-2">
+        <button
+          type="button"
+          className={mode === "chat" ? "btn-primary" : "btn-secondary"}
+          onClick={() => setMode("chat")}
+        >
+          Chat with Claims Agent
+        </button>
+        <button
+          type="button"
+          className={mode === "specialist" ? "btn-primary" : "btn-secondary"}
+          onClick={() => setMode("specialist")}
+        >
+          Ask a specialist
+        </button>
+      </div>
+      {mode === "chat" ? <ChatWithClaimsAgent /> : <AskSpecialistPanel />}
+    </div>
+  );
+}
+
+/** The original multi-turn chat thread (docs/plan.md §14) - always against the Claims Agent
+ * (ClaimAgentService.ContinueSessionAsync is hardcoded to it), history carried server-side. */
+function ChatWithClaimsAgent() {
   const queryClient = useQueryClient();
   const [sessionId, setSessionId] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
@@ -56,7 +83,7 @@ export function AgentQueryPage() {
   }
 
   return (
-    <div className="flex h-[calc(100vh-4rem)] gap-6">
+    <div className="flex h-[calc(100vh-8rem)] gap-6">
       <aside className="flex w-64 shrink-0 flex-col">
         <button
           type="button"
@@ -148,6 +175,107 @@ export function AgentQueryPage() {
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * One-shot Q&A against any named specialist (docs/plan-agents.md §2/§8: Claims, Worker
+ * Management, Risk & Escalation, Notification) - GET /api/agents for the catalog,
+ * POST /api/agents/{agentName}/query to ask. Always read-only regardless of which agent is
+ * picked (queries never queue an approval), no session/history - each question stands alone.
+ */
+function AskSpecialistPanel() {
+  const [agentName, setAgentName] = useState<string | null>(null);
+  const [prompt, setPrompt] = useState("");
+  const [result, setResult] = useState<AgentRunLogDto | null>(null);
+
+  const catalog = useQuery({ queryKey: ["agentCatalog"], queryFn: agentCatalogApi.list });
+
+  useEffect(() => {
+    if (agentName === null && catalog.data && catalog.data.length > 0) {
+      setAgentName(catalog.data[0].name);
+    }
+  }, [agentName, catalog.data]);
+
+  const ask = useMutation({
+    mutationFn: () => agentCatalogApi.query(agentName!, prompt.trim()),
+    onSuccess: (data) => {
+      setResult(data);
+      setPrompt("");
+    },
+  });
+
+  function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (agentName && prompt.trim()) ask.mutate();
+  }
+
+  const selected = catalog.data?.find((a) => a.name === agentName) ?? null;
+
+  return (
+    <div>
+      <h1 className="text-2xl font-semibold text-slate-900">Ask a specialist</h1>
+      <p className="mt-1 text-sm text-slate-500">
+        Pick one of the specialist agents and ask it a single question - read-only, no memory
+        between questions. For a running conversation, use "Chat with Claims Agent" instead.
+      </p>
+
+      {catalog.isLoading && <LoadingState />}
+      {catalog.error && <ErrorBanner message={apiErrorMessage(catalog.error)} />}
+
+      {catalog.data && (
+        <div className="panel mt-4 p-6">
+          <label className="block text-sm text-slate-600">
+            Agent
+            <select
+              value={agentName ?? ""}
+              onChange={(e) => setAgentName(e.target.value)}
+              className="field-input mt-1 block w-full max-w-sm"
+            >
+              {catalog.data.map((a) => (
+                <option key={a.name} value={a.name}>
+                  {a.displayName}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          {selected && (
+            <p className="mt-2 text-xs text-slate-400">Tools: {selected.toolNames.join(", ")}</p>
+          )}
+
+          <form onSubmit={handleSubmit} className="mt-4 flex gap-3">
+            <input
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              placeholder="Ask a question…"
+              className="field-input flex-1"
+              disabled={ask.isPending}
+            />
+            <button type="submit" className="btn-primary" disabled={ask.isPending || !prompt.trim()}>
+              {ask.isPending ? "Asking…" : "Ask"}
+            </button>
+          </form>
+
+          {ask.error && <ErrorBanner message={apiErrorMessage(ask.error)} />}
+
+          {result && (
+            <div className="mt-5 space-y-1.5 rounded-lg bg-slate-100 px-4 py-3 text-sm text-slate-800">
+              <p className="whitespace-pre-wrap">{result.finalAnswer}</p>
+              {result.reasoningText && (
+                <p className="whitespace-pre-wrap text-xs text-slate-500">
+                  <span className="font-medium">Reasoning:</span> {result.reasoningText}
+                </p>
+              )}
+              <div className="flex items-center gap-2 pt-1">
+                <span className={outcomeBadgeClasses(result.outcome)}>{result.outcome}</span>
+                <span className="text-xs text-slate-400">{result.toolCallCount} tool call(s)</span>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

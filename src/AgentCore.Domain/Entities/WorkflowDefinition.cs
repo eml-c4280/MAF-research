@@ -32,4 +32,10 @@ public class WorkflowDefinition
     public bool IsActive { get; set; } = true;
     public string CreatedByRole { get; set; } = string.Empty;
     public DateTime CreatedAtUtc { get; set; } = DateTime.UtcNow;
+
+    /// <summary>Phase 13 (docs/plan-agents.md): an ordered sequence of specialist-agent steps -
+    /// when non-empty, this definition runs on the multi-agent path instead of the single-agent
+    /// path above (AllowedToolNamesJson/PromptTemplate are then unused). Additive: every
+    /// definition seeded before Phase 13 has no steps and keeps working unchanged.</summary>
+    public List<WorkflowStepDefinition> Steps { get; set; } = [];
 }

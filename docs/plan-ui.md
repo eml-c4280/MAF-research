@@ -267,11 +267,32 @@ working, demoable app — later phases add capability, they don't fix earlier on
   Verified against the real running stack: logged in as the seeded SuperAdmin, created a
   CaseManager account from the Users page, assigned a worker to them from the Workers page,
   confirmed the CaseManager's own login only ever lists that one worker.
+- [x] **Phase UI-8 — Multi-agent architecture adaptation (2026-09-22).** ✅ Done. Brought the UI
+  up to date with the backend's Phase 13 (`docs/plan-agents.md`) - the four-specialist agent
+  catalog and multi-step workflow pipeline had zero UI exposure before this. `api/types.ts`:
+  `PendingActionType` gained `NotifyCaseManager`; `KNOWN_TOOL_NAMES` gained `CaseManagerNotifier`;
+  new `AgentCatalogEntryDto` and `AgentRunStepDto`; `ProcessClaimResponse` gained a `steps` array
+  (one entry per specialist agent that ran, alongside the existing `run` field which stays "the
+  final step's answer" for compatibility). `api/agent.ts` gained `agentCatalogApi` (`GET
+  /api/agents`, `POST /api/agents/{agentName}/query`) - shapes verified field-by-field against
+  the real running API, not guessed. `ClaimsListPage`'s "Run agent" result now renders a
+  "Pipeline" section - each specialist's name, outcome badge, tool-call count, and final answer,
+  in order - above the existing final-step run details, since processing a claim is a fixed
+  three-agent sequence now, not one monolithic call. `AgentQueryPage` gained a mode toggle: the
+  existing multi-turn "Chat with Claims Agent" thread, or a new "Ask a specialist" one-shot panel
+  (agent picker from the live catalog + a single question, always read-only regardless of which
+  agent is asked, no history between questions). **Not done, deliberately**: authoring/viewing a
+  multi-step `WorkflowDefinition`'s own `Steps` from the UI - `CreateWorkflowRequest` itself has
+  no `Steps` field yet (multi-step workflows are still seeded, not authored via the API), and a
+  generic `POST /api/workflows/{id}/run` response has no per-step breakdown the way
+  `ProcessClaimResponse` now does - both are backend gaps, out of scope for a UI-only pass, and
+  already tracked as deferred in `docs/plan-agents.md` §11/§14.
 
 **Current state**: a real, usable app is running against the live stack - Dashboard, all three
-read-only lists, Agent Query, "Run agent" on Claims, the full Approvals loop, Workflows, and now
-real login + User management + worker/case-manager assignment, all verified against the actual
-running API/database/Ollama, not mocked. Remaining work, in priority order: detail pages + claim
+read-only lists, Agent Query (chat + ask-a-specialist), "Run agent" on Claims (with the full
+per-specialist pipeline breakdown), the full Approvals loop, Workflows, real login + User
+management + worker/case-manager assignment, all verified against the actual running
+API/database/Ollama, not mocked. Remaining work, in priority order: detail pages + claim
 search/filters (finishing UI-2), then write forms for Workers/Policies/Claims (UI-3), then the
 live panel and Docker packaging (UI-5/UI-6) as originally planned.
 

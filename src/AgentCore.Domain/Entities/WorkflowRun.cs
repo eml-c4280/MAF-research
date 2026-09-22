@@ -27,4 +27,10 @@ public class WorkflowRun
     public double? MatchConfidence { get; set; }
 
     public DateTime CreatedAtUtc { get; set; } = DateTime.UtcNow;
+
+    /// <summary>Phase 13 (docs/plan-agents.md): one row per executed step for a multi-agent run -
+    /// empty for a legacy single-agent run. AgentRunLogId above keeps meaning "the answer" either
+    /// way - for a multi-step run it's set to the *final* step's AgentRunLogId, so existing code
+    /// reading it needs no change; this collection is where the full per-step detail lives.</summary>
+    public List<WorkflowRunStep> Steps { get; set; } = [];
 }

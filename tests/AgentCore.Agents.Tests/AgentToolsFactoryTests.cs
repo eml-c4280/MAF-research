@@ -77,11 +77,11 @@ public class AgentToolsFactoryTests : IClassFixture<WebApplicationFactory<Progra
         // 3 auto tools + 3 rule tools (CV/ES/FR - docs/business-logic.md §4) - rule tools have no
         // side effect, so they're freely callable the same as auto tools.
         Assert.Equal(6, tools.Count);
-        Assert.DoesNotContain(tools, t => t.Name is "WorkerEmailSender" or "EscalationEmailSender" or "PayoutCalculator");
+        Assert.DoesNotContain(tools, t => t.Name is "WorkerEmailSender" or "EscalationEmailSender" or "PayoutCalculator" or "CaseManagerNotifier");
     }
 
     [Fact]
-    public async Task BuildToolsetAsync_IncludingSensitiveTools_ReturnsAllNineExpectedNames()
+    public async Task BuildToolsetAsync_IncludingSensitiveTools_ReturnsAllTenExpectedNames()
     {
         var factory = await CreateSubjectAsync();
         var tools = await factory.BuildToolsetAsync(includeSensitiveTools: true, TestCaller);
@@ -90,7 +90,7 @@ public class AgentToolsFactoryTests : IClassFixture<WebApplicationFactory<Progra
         {
             "WorkerInformationFetcher", "ClaimsSearcher", "WorkerClaimsHistoryFetcher",
             "CoverageChecker", "EscalationEvaluator", "ClaimRiskScorer",
-            "WorkerEmailSender", "EscalationEmailSender", "PayoutCalculator"
+            "WorkerEmailSender", "EscalationEmailSender", "PayoutCalculator", "CaseManagerNotifier"
         };
 
         Assert.Equal(expectedNames.ToHashSet(), tools.Select(t => t.Name).ToHashSet());

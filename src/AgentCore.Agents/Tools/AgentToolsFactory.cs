@@ -6,7 +6,7 @@ namespace AgentCore.Agents.Tools;
 
 /// <summary>
 /// Discovers the claim/worker tool set from the ClaimsToolsServer MCP server and assembles the
-/// per-run <see cref="AITool"/> list, so <see cref="WorkerClaimAgentFactory"/> doesn't need to
+/// per-run <see cref="AITool"/> list, so <see cref="AgentFactory"/> doesn't need to
 /// know which tools exist or talk to MCP itself.
 ///
 /// Connects fresh per call, one deliberate reversal of an earlier decision (docs/plan.md section
@@ -28,7 +28,7 @@ public class AgentToolsFactory
     // auto/sensitive split that gates which tools a run may use stays a client-side concern,
     // keyed by the same tool names the server registers them under.
     private static readonly HashSet<string> SensitiveToolNames =
-        ["WorkerEmailSender", "EscalationEmailSender", "PayoutCalculator"];
+        ["WorkerEmailSender", "EscalationEmailSender", "PayoutCalculator", "CaseManagerNotifier"];
 
     private readonly string? _endpoint;
     private readonly McpClient? _fixedClientForTests;
@@ -60,9 +60,9 @@ public class AgentToolsFactory
             .ToList();
     }
 
-    /// <summary>Workflow variant (docs/plan.md §11): an explicit allowlist rather than the
-    /// binary auto/sensitive split above - a WorkflowDefinition.AllowedToolNamesJson names
-    /// exactly the tools its agent may see, sensitive or not.</summary>
+    /// <summary>Legacy single-agent workflow variant (docs/plan.md §11): an explicit allowlist
+    /// rather than the binary auto/sensitive split above - a WorkflowDefinition.AllowedToolNamesJson
+    /// names exactly the tools its agent may see, sensitive or not.</summary>
     public async Task<List<AITool>> BuildToolsetAsync(IReadOnlySet<string> allowedToolNames, CallerIdentity caller, CancellationToken ct = default)
     {
         var client = await ConnectAsync(caller, ct);
@@ -70,6 +70,25 @@ public class AgentToolsFactory
 
         return tools
             .Where(t => allowedToolNames.Contains(t.Name))
+            .Cast<AITool>()
+            .ToList();
+    }
+
+    /// <summary>Catalog-agent variant (Phase 13, docs/plan-agents.md §6): starts from a specialist
+    /// AgentDefinition's fixed tool set, then optionally strips its sensitive tools too - used for
+    /// an ad-hoc free-form query against any agent (GET /api/agents/{agentName}/query), which
+    /// stays read-only regardless of which agent is asked, the same way today's plain
+    /// /api/agent/query never lets the model act. A workflow step invoking this same agent passes
+    /// includeSensitiveTools: true, since that execution is deliberately configured and audited.</summary>
+    public async Task<List<AITool>> BuildToolsetAsync(
+        IReadOnlySet<string> allowedToolNames, bool includeSensitiveTools, CallerIdentity caller, CancellationToken ct = default)
+    {
+        var client = await ConnectAsync(caller, ct);
+        var tools = await client.ListToolsAsync(cancellationToken: ct);
+
+        return tools
+            .Where(t => allowedToolNames.Contains(t.Name))
+            .Where(t => includeSensitiveTools || !SensitiveToolNames.Contains(t.Name))
             .Cast<AITool>()
             .ToList();
     }
